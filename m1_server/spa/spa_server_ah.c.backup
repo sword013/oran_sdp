@@ -1,0 +1,394 @@
+// spa_server_ah.c (AH / Gateway SPA Listener for IHs)
+#define _GNU_SOURCE // For asprintf
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <pcap.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <arpa/inet.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/err.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <ifaddrs.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <endian.h>
+
+#include "spa_common.h"
+#include "ah_structs.h" // Include AH-specific structs
+
+// --- Function Prototypes ---
+void spa_ah_cleanup(int signo);
+int load_ephemeral_policies(const char *filename); // Specific loader
+ephemeral_policy_t* find_ephemeral_policy(const char *ip_str);
+void free_ephemeral_policies(ephemeral_policy_t *head);
+// Assumed external or defined elsewhere:
+// handle_openssl_error_server, constant_time_memcmp, get_interface_ip,
+// protocol_to_string, string_to_protocol, trim_whitespace, hex_string_to_bytes, generate_hotp
+
+// --- Global Variables ---
+pcap_t *spa_ah_pcap_handle = NULL;
+ephemeral_policy_t *g_ephemeral_policies = NULL; // Head of ephemeral policies
+pthread_mutex_t g_eph_policy_lock = PTHREAD_MUTEX_INITIALIZER; // Lock for list/file access
+
+// --- Config Loading ---
+int load_ephemeral_policies(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        // It's okay if file doesn't exist initially, might be populated later
+        if (errno == ENOENT) {
+             printf("[SPA_AH] Ephemeral policy file '%s' not found. Waiting for controller updates.\n", filename);
+             return 1; // Not an error if file doesn't exist yet
+        }
+        perror("Error opening ephemeral policy file");
+        return 0;
+    }
+    printf("[SPA_AH] Loading ephemeral policies from: %s\n", filename);
+
+    char line[1024]; int line_num = 0; int policies_loaded = 0;
+    ephemeral_policy_t *current_policy = NULL;
+    ephemeral_policy_t *new_list_head = NULL; // Build new list to replace old one atomically
+    time_t now = time(NULL);
+
+    while (fgets(line, sizeof(line), fp)) {
+        line_num++;
+        char *trimmed_line = trim_whitespace(line);
+        if (!trimmed_line || trimmed_line[0] == '\0' || trimmed_line[0] == '#') continue;
+
+        if (trimmed_line[0] == '[' && trimmed_line[strlen(trimmed_line) - 1] == ']') {
+            if (current_policy) { // Finalize previous
+                if (current_policy->has_enc && current_policy->has_hmac && current_policy->has_hotp && current_policy->has_counter && current_policy->has_proto && current_policy->has_port && current_policy->has_expiry) {
+                   // Check expiry before adding to new list
+                   if (current_policy->expiry_timestamp > now) {
+                       current_policy->next = new_list_head; new_list_head = current_policy; policies_loaded++;
+                       printf("  + Loaded valid ephemeral policy for: %s\n", current_policy->ih_ip_str);
+                       current_policy = NULL; // Reset pointer so it's not freed below
+                   } else {
+                       printf("  - Discarding expired policy for [%s] from file.\n", current_policy->ih_ip_str);
+                   }
+                } else { fprintf(stderr,"[SPA_AH] Warn: Discard incomplete eph. entry for [%s] line %d\n", current_policy->ih_ip_str, line_num-1); }
+                if(current_policy) { free_allowed_services(current_policy->allowed_services); free(current_policy); } // Free incomplete/expired
+                current_policy = NULL;
+            }
+            // Start new
+            current_policy = malloc(sizeof(ephemeral_policy_t));
+            if (!current_policy) { perror("Malloc ephemeral policy"); fclose(fp); free_ephemeral_policies(new_list_head); return 0;}
+            memset(current_policy, 0, sizeof(ephemeral_policy_t));
+            size_t id_len = strlen(trimmed_line) - 2;
+            if (id_len==0 || id_len>=INET_ADDRSTRLEN){ fprintf(stderr,"[SPA_AH] Invalid header line %d\n",line_num); free(current_policy); current_policy=NULL; continue;}
+            strncpy(current_policy->ih_ip_str, trimmed_line + 1, id_len); current_policy->ih_ip_str[id_len] = '\0';
+            struct sockaddr_in sa; if(inet_pton(AF_INET, current_policy->ih_ip_str, &sa.sin_addr)!=1){fprintf(stderr,"[SPA_AH] Invalid IP '%s' line %d\n", current_policy->ih_ip_str, line_num); free(current_policy); current_policy=NULL; continue;}
+            printf("  Parsing ephemeral stanza for IH IP: %s\n", current_policy->ih_ip_str);
+
+        } else if (current_policy) {
+             char *key = trimmed_line; char *value = NULL;
+             for (char *p = key; *p != '\0'; ++p) { if (isspace((unsigned char)*p) || *p == '=') { *p = '\0'; value = p + 1; while (*value != '\0' && (isspace((unsigned char)*value) || *value == '=')) { value++; } break; } }
+
+             if (value && *value != '\0') {
+                 key = trim_whitespace(key); value = trim_whitespace(value);
+                 if (strlen(key) == 0) continue;
+
+                 if (strcasecmp(key, "ENCRYPTION_KEY") == 0) { int len=hex_string_to_bytes(value, current_policy->enc_key, MAX_KEY_LEN); if(len>0){current_policy->enc_key_len=len; current_policy->has_enc=1;} else fprintf(stderr,"[SPA_AH] Invalid Eph ENC key line %d\n",line_num); }
+                 else if (strcasecmp(key, "HMAC_KEY") == 0) { int len=hex_string_to_bytes(value, current_policy->hmac_key, MAX_KEY_LEN); if(len>0){current_policy->hmac_key_len=len; current_policy->has_hmac=1;} else fprintf(stderr,"[SPA_AH] Invalid Eph HMAC key line %d\n",line_num); }
+                 else if (strcasecmp(key, "HOTP_SECRET") == 0) { int len=hex_string_to_bytes(value, current_policy->hotp_secret, MAX_KEY_LEN); if(len>0){current_policy->hotp_secret_len=len; current_policy->has_hotp=1;} else fprintf(stderr,"[SPA_AH] Invalid Eph HOTP secret line %d\n",line_num); }
+                 else if (strcasecmp(key, "HOTP_NEXT_COUNTER") == 0) { current_policy->hotp_next_counter = strtoull(value, NULL, 10); current_policy->has_counter=1; }
+                 else if (strcasecmp(key, "ALLOWED_PROTO") == 0) { int p = atoi(value); if(p>0 && p<=255){current_policy->allowed_proto=p; current_policy->has_proto=1;} else fprintf(stderr,"[SPA_AH] Invalid ALLOWED_PROTO line %d\n",line_num); }
+                 else if (strcasecmp(key, "ALLOWED_PORT") == 0) { int p = atoi(value); if(p>=0 && p<=65535){current_policy->allowed_port=p; current_policy->has_port=1;} else fprintf(stderr,"[SPA_AH] Invalid ALLOWED_PORT line %d\n",line_num); }
+                 else if (strcasecmp(key, "EXPIRY_TIMESTAMP") == 0) { current_policy->expiry_timestamp = (time_t)strtoul(value, NULL, 10); current_policy->has_expiry=1; }
+                 else { fprintf(stderr,"[SPA_AH] Warn: Unknown key '%s' line %d\n",key,line_num);}
+             } else { fprintf(stderr,"[SPA_AH] Warn: Malformed line %d for %s\n",line_num, current_policy->ih_ip_str);}
+        }
+    }
+     // Finalize last entry
+    if (current_policy) {
+        if (current_policy->has_enc && current_policy->has_hmac && current_policy->has_hotp && current_policy->has_counter && current_policy->has_proto && current_policy->has_port && current_policy->has_expiry) {
+            if (current_policy->expiry_timestamp > now) {
+               current_policy->next = new_list_head; new_list_head = current_policy; policies_loaded++;
+               printf("  + Loaded valid ephemeral policy for: %s\n", current_policy->ih_ip_str);
+            } else { printf("  - Discarding expired policy for [%s] from file.\n", current_policy->ih_ip_str); free(current_policy);}
+        } else { fprintf(stderr,"[SPA_AH] Warn: Discard incomplete eph. entry for [%s] EOF\n", current_policy->ih_ip_str); free(current_policy); }
+    }
+
+    fclose(fp);
+
+    // Atomically replace the global list
+    pthread_mutex_lock(&g_eph_policy_lock);
+    free_ephemeral_policies(g_ephemeral_policies); // Free the old list
+    g_ephemeral_policies = new_list_head;       // Assign the new list
+    pthread_mutex_unlock(&g_eph_policy_lock);
+
+    printf("[SPA_AH] Finished loading ephemeral policies. %d currently valid policies loaded.\n", policies_loaded);
+    return 1; // Success in reading/parsing (even if 0 loaded)
+}
+
+
+ephemeral_policy_t* find_ephemeral_policy(const char *ip_str) {
+    if (!ip_str) return NULL;
+    // Lock needed as list can be modified by reload/cleanup thread
+    pthread_mutex_lock(&g_eph_policy_lock);
+    ephemeral_policy_t *current = g_ephemeral_policies;
+    ephemeral_policy_t *found = NULL;
+    time_t now = time(NULL);
+
+    while (current != NULL) {
+        if (strcmp(current->ih_ip_str, ip_str) == 0) {
+             // Check expiry while holding lock
+             if (current->expiry_timestamp > now) {
+                 found = current; // Found valid policy
+             } else {
+                  printf("[SPA_AH] Found expired policy for %s during lookup.\n", ip_str);
+                  // Optionally trigger removal here, but cleanup script is main mechanism
+             }
+             break; // Found entry (expired or not), stop searching
+        }
+        current = current->next;
+    }
+    pthread_mutex_unlock(&g_eph_policy_lock);
+    return found;
+}
+
+void free_ephemeral_policies(ephemeral_policy_t *head) {
+     ephemeral_policy_t *current = head, *next;
+     // No need to print here, done within lock usually
+     while(current){ next = current->next; free(current); current = next;}
+     // g_ephemeral_policies should be set to NULL by caller after lock
+}
+
+// --- Basic iptables Command Execution (AH specific) ---
+int run_ah_iptables_rule(const char* action, const char* source_ip, uint16_t target_port) {
+     char *command = NULL; int ret;
+     // Rule allows TCP to the ephemeral mTLS port for this IH
+     if (asprintf(&command, "sudo iptables %s INPUT -s %s -p tcp --dport %u -m comment --comment \"SPA_AH_ALLOW_%s\" -j ACCEPT",
+                  action, source_ip, target_port, source_ip) == -1) { perror("asprintf"); return -1; }
+     printf("[SPA_AH] Executing: %s\n", command);
+     ret = system(command); free(command);
+     if (ret == -1) { perror("system(iptables)"); return -1;}
+     if (WIFEXITED(ret) && WEXITSTATUS(ret) == 0) { printf(" iptables %s OK\n", action); return 0; }
+     else { fprintf(stderr," iptables %s FAILED (status %d)\n", action, WEXITSTATUS(ret)); return -1; }
+}
+
+
+// --- Packet Handler (AH Ephemeral SPA) ---
+void spa_ah_packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+    const int ETH_HDR_LEN = 14;
+    char source_ip_str[INET_ADDRSTRLEN];
+    struct tm *tm_info; time_t now; char time_buf[30];
+    (void)user_data;
+
+    now = time(NULL); tm_info = localtime(&now); strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    printf("\n[%s] AH SPA Packet received (len %u)\n", time_buf, pkthdr->len);
+
+    if (pkthdr->caplen < (unsigned int)ETH_HDR_LEN) return;
+    const struct ip *ip_header = (struct ip *)(packet + ETH_HDR_LEN);
+    int ip_hdr_len = ip_header->ip_hl * 4;
+    if (pkthdr->caplen < (unsigned int)(ETH_HDR_LEN + ip_hdr_len)) return;
+    if (ip_header->ip_p != IPPROTO_UDP) return;
+    const struct udphdr *udp_header = (struct udphdr *)((u_char *)ip_header + ip_hdr_len);
+    int udp_hdr_len = sizeof(struct udphdr);
+    if (pkthdr->caplen < (unsigned int)(ETH_HDR_LEN + ip_hdr_len + udp_hdr_len)) return;
+
+    inet_ntop(AF_INET, &(ip_header->ip_src), source_ip_str, INET_ADDRSTRLEN);
+    printf("  Source IP: %s\n", source_ip_str);
+
+    // --- Find Ephemeral Policy for this Source IH IP ---
+    ephemeral_policy_t *policy = find_ephemeral_policy(source_ip_str); // Checks expiry too
+    if (!policy) {
+        printf("  -> Discarding: No valid/unexpired ephemeral policy found for source IP %s.\n", source_ip_str);
+        return;
+    }
+    printf("  Ephemeral policy found for %s. Validating SPA...\n", source_ip_str);
+
+    // --- SPA Processing ---
+    const u_char *payload = (u_char *)udp_header + udp_hdr_len;
+    int payload_len = pkthdr->caplen - (ETH_HDR_LEN + ip_hdr_len + udp_hdr_len);
+    if ((size_t)payload_len < SPA_PACKET_MIN_LEN || (size_t)payload_len > SPA_PACKET_MAX_LEN) { printf("  -> Discard: Invalid payload len %d\n", payload_len); return; }
+
+    const unsigned char *iv = payload;
+    const unsigned char *encrypted_data = payload + SPA_IV_LEN;
+    int encrypted_len = payload_len - SPA_IV_LEN - SPA_HMAC_LEN;
+    const unsigned char *received_hmac = payload + SPA_IV_LEN + encrypted_len;
+    if (encrypted_len <= 0) { printf("  -> Discard: Invalid enc len %d\n", encrypted_len); return; }
+
+    // --- 1. Verify HMAC (Ephemeral Key) ---
+    printf("  Verifying HMAC (Ephemeral)... ");
+    unsigned char calculated_hmac[EVP_MAX_MD_SIZE]; unsigned int calc_hmac_len = 0;
+    const EVP_MD *digest = EVP_get_digestbyname(SPA_HMAC_ALGO); if (!digest) return;
+    unsigned char data_to_hmac[SPA_IV_LEN + encrypted_len];
+    memcpy(data_to_hmac, iv, SPA_IV_LEN); memcpy(data_to_hmac + SPA_IV_LEN, encrypted_data, encrypted_len);
+    HMAC(digest, policy->hmac_key, policy->hmac_key_len, data_to_hmac, SPA_IV_LEN + encrypted_len, calculated_hmac, &calc_hmac_len);
+    if (calc_hmac_len != SPA_HMAC_LEN || constant_time_memcmp(received_hmac, calculated_hmac, SPA_HMAC_LEN) != 0) {
+        printf("FAILED (HMAC Mismatch)\n"); printf("  -> Discarding: Invalid HMAC for %s (Ephemeral).\n", source_ip_str); return;
+    }
+    printf("OK\n");
+
+    // --- 2. Decrypt Data (Ephemeral Key) ---
+    printf("  Decrypting data (Ephemeral)... ");
+    unsigned char decrypted_data[sizeof(spa_data_t)]; int decrypted_len = 0, final_len = 0; int decrypt_ok = 1;
+    const EVP_CIPHER *cipher = EVP_get_cipherbyname(SPA_ENCRYPTION_ALGO); if (!cipher) return;
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new(); if (!ctx) return;
+    if (1!=EVP_DecryptInit_ex(ctx, cipher, NULL, policy->enc_key, iv)) { decrypt_ok = 0; }
+    if (decrypt_ok && 1!=EVP_DecryptUpdate(ctx, decrypted_data, &decrypted_len, encrypted_data, encrypted_len)) { ERR_clear_error(); decrypt_ok = 0; }
+    if (decrypt_ok && 1!=EVP_DecryptFinal_ex(ctx, decrypted_data + decrypted_len, &final_len)) { ERR_clear_error(); decrypt_ok = 0; }
+    EVP_CIPHER_CTX_free(ctx);
+    if (!decrypt_ok) { printf("FAILED (Decryption Error)\n"); printf("  -> Discarding: Decryption failed for %s (Ephemeral).\n", source_ip_str); return; }
+    decrypted_len += final_len;
+    printf("OK (Plaintext size %d)\n", decrypted_len);
+
+    // --- 3. Validate Payload & HOTP (Ephemeral) ---
+    if ((size_t)decrypted_len != sizeof(spa_data_t)) { fprintf(stderr," Error: Size %d != %zu.\n", decrypted_len, sizeof(spa_data_t)); return; }
+    spa_data_t *spa_info = (spa_data_t *)decrypted_data;
+    uint64_t received_timestamp = be64toh(spa_info->timestamp);
+    uint64_t received_hotp_counter = be64toh(spa_info->hotp_counter);
+    uint32_t received_hotp_code = ntohl(spa_info->hotp_code);
+    uint8_t requested_protocol = spa_info->req_protocol;
+    uint16_t requested_port = ntohs(spa_info->req_port);
+
+    if (spa_info->version != SPA_VERSION) { fprintf(stderr," Error: Version %u\n",spa_info->version); return; }
+    time_t current_time = time(NULL); int64_t time_diff = (int64_t)current_time - (int64_t)received_timestamp;
+    if (llabs(time_diff) > SPA_TIMESTAMP_WINDOW_SECONDS) { fprintf(stderr," Error: Timestamp %llds > %ds\n",(long long)time_diff, SPA_TIMESTAMP_WINDOW_SECONDS); return; }
+
+    printf("  Payload OK. Validating HOTP (Ephemeral)...\n");
+    printf("    Received Counter: %llu, Received Code: %0*u\n", (unsigned long long)received_hotp_counter, HOTP_CODE_DIGITS, received_hotp_code);
+
+    // HOTP Validation (Lock ephemeral list/entry for counter update)
+    pthread_mutex_lock(&g_eph_policy_lock);
+    // Re-find policy inside lock to ensure it wasn't just removed/expired
+    ephemeral_policy_t *locked_policy = find_ephemeral_policy(source_ip_str); // find locks/unlocks itself
+    int hotp_match = 0;
+    if (locked_policy) { // Re-check if found and not expired
+        uint64_t expected_counter = locked_policy->hotp_next_counter;
+        uint64_t matched_counter = 0; // Use separate variable
+
+        if (received_hotp_counter < expected_counter || received_hotp_counter > expected_counter + HOTP_COUNTER_SYNC_WINDOW) {
+            fprintf(stderr, "    HOTP Counter %llu out of sync window (exp >= %llu, <= %llu)\n", (unsigned long long)received_hotp_counter, (unsigned long long)expected_counter, (unsigned long long)(expected_counter + HOTP_COUNTER_SYNC_WINDOW));
+        } else {
+            for (uint64_t counter_check = received_hotp_counter; counter_check <= expected_counter + HOTP_COUNTER_SYNC_WINDOW; ++counter_check) {
+                uint32_t calculated_code = generate_hotp(locked_policy->hotp_secret, locked_policy->hotp_secret_len, counter_check, HOTP_CODE_DIGITS);
+                 // printf("    Check Ctr: %llu -> Calc Code: %0*u\n", (unsigned long long)counter_check, HOTP_CODE_DIGITS, calculated_code); // Verbose debug
+                if (calculated_code == received_hotp_code) {
+                    hotp_match = 1;
+                    matched_counter = counter_check; // Record which counter matched
+                    locked_policy->hotp_next_counter = matched_counter + 1; // Update expected counter
+                    // NOTE: Need to save this updated counter back to access_ah.conf!
+                    // This simple implementation doesn't do that; requires file rewrite.
+                     printf("    HOTP MATCH FOUND at counter %llu! Updated next counter to %llu (State saving NOT implemented).\n", (unsigned long long)matched_counter, (unsigned long long)locked_policy->hotp_next_counter);
+                    break;
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_eph_policy_lock); // Unlock policy list
+    } else {
+         pthread_mutex_unlock(&g_eph_policy_lock); // Unlock policy list if re-find failed
+         printf("  -> Discarding: Policy for %s expired or removed during HOTP check.\n", source_ip_str);
+         return;
+    }
+
+
+    if (!hotp_match) {
+        fprintf(stderr, "    HOTP Validation FAILED.\n");
+        printf("  -> Discarding: Invalid HOTP for %s (Ephemeral).\n", source_ip_str);
+        return;
+    }
+    printf("  HOTP Validation OK.\n");
+
+    // --- 4. Policy Check (Ephemeral Policy) ---
+    if (requested_protocol == policy->allowed_proto &&
+        (requested_port == policy->allowed_port || policy->allowed_port == 0)) {
+        printf("  Ephemeral policy allows access to %s/%u.\n", protocol_to_string(requested_protocol), requested_port);
+
+        // --- 5. Authorize Access to AH Ephemeral mTLS Port ---
+         printf("  VALID EPHEMERAL SPA Packet from %s. Authorizing mTLS access...\n", source_ip_str);
+         // The target port is determined by the controller, assume default for now
+         uint16_t ah_mtls_listen_port = AH_MTLS_PORT_DEFAULT; // FIXME: Should get this from controller via ah.c
+
+         if (run_ah_iptables_rule("-I", source_ip_str, ah_mtls_listen_port) == 0) {
+            char *remove_cmd = NULL;
+            if(asprintf(&remove_cmd, "sh -c 'sleep %d && sudo iptables -D INPUT -s %s -p tcp --dport %u -m comment --comment \"SPA_AH_ALLOW_%s\" -j ACCEPT' &", SPA_DEFAULT_DURATION_SECONDS, source_ip_str, ah_mtls_listen_port, source_ip_str) != -1){
+                printf("  Scheduling iptables cleanup: %s\n", remove_cmd);
+                system(remove_cmd); free(remove_cmd);
+            }
+         } else { fprintf(stderr,"[SPA_AH] Failed to add AH iptables rule for %s\n", source_ip_str); }
+
+    } else {
+        printf("  POLICY VIOLATION (Ephemeral): Requested %s/%u, policy allows %s/%u.\n",
+            protocol_to_string(requested_protocol), requested_port,
+            protocol_to_string(policy->allowed_proto), policy->allowed_port);
+         printf("  -> Discarding: Request denied by ephemeral policy for %s.\n", source_ip_str);
+    }
+     printf("----------------------------------------\n");
+}
+
+
+// --- Main SPA Server Function (AH) ---
+int main(int argc, char *argv[]) {
+    char errbuf[PCAP_ERRBUF_SIZE]; char *dev = NULL; bpf_u_int32 net, mask; struct bpf_program fp;
+    char filter_exp[100]; int use_strdup = 0;
+
+    if (geteuid() != 0) { fprintf(stderr, "[SPA_AH] Error: Requires root privileges.\n"); return 1; }
+
+    // --- Load Ephemeral Policies (initial load) ---
+    if (!load_ephemeral_policies("access_ah.conf")) {
+        fprintf(stderr, "[SPA_AH] Error loading initial ephemeral policies. Continuing...\n");
+        // Allow continuing even if file doesn't exist or is empty initially
+    }
+    // --- TODO: Need a mechanism to RELOAD policies when updated by controller ---
+    //     (e.g., signal handler, inotify, timer)
+
+    // --- Interface selection ---
+     if (argc > 2 && strcmp(argv[1], "-i") == 0) { /* ... same as controller ... */ }
+     else if (argc > 1) { fprintf(stderr, "[SPA_AH] Usage: %s [-i interface]\n", argv[0]); free_ephemeral_policies(g_ephemeral_policies); return 1; }
+     else { dev = pcap_lookupdev(errbuf); if(!dev){/* ... fallback ...*/} }
+     printf("[SPA_AH] Using interface: %s\n", dev);
+
+    // --- Crypto Init ---
+    OpenSSL_add_all_algorithms(); ERR_load_crypto_strings();
+    if (!EVP_get_cipherbyname(SPA_ENCRYPTION_ALGO)) { fprintf(stderr, "Fatal Enc Algo\n"); goto common_cleanup; }
+    if (!EVP_get_digestbyname(SPA_HMAC_ALGO)) { fprintf(stderr, "Fatal HMAC Algo\n"); goto common_cleanup; }
+    if (!EVP_get_digestbyname(SPA_HOTP_HMAC_ALGO)) { fprintf(stderr, "Fatal HOTP Algo\n"); goto common_cleanup; }
+    printf("[SPA_AH] Crypto algorithms OK.\n");
+
+    // --- Pcap Setup ---
+    if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) { net=0; mask=0; }
+    spa_ah_pcap_handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    if (!spa_ah_pcap_handle) { fprintf(stderr, "[SPA_AH] Fatal: pcap_open_live: %s\n", errbuf); goto common_cleanup; }
+    if (pcap_datalink(spa_ah_pcap_handle) != DLT_EN10MB) { fprintf(stderr, "[SPA_AH] Warn: Not Ethernet.\n"); }
+    snprintf(filter_exp, sizeof(filter_exp), "udp dst port %d", SPA_LISTENER_PORT);
+    printf("[SPA_AH] Compiling filter: '%s'\n", filter_exp);
+    if (pcap_compile(spa_ah_pcap_handle, &fp, filter_exp, 0, net) == -1) { fprintf(stderr, "[SPA_AH] Fatal: Compile: %s\n", pcap_geterr(spa_ah_pcap_handle)); pcap_close(spa_ah_pcap_handle); goto common_cleanup; }
+    if (pcap_setfilter(spa_ah_pcap_handle, &fp) == -1) { fprintf(stderr, "[SPA_AH] Fatal: Set filter: %s\n", pcap_geterr(spa_ah_pcap_handle)); pcap_freecode(&fp); pcap_close(spa_ah_pcap_handle); goto common_cleanup; }
+
+    printf("[SPA_AH] SPA Server listening on %s, UDP port %d (for Ephemeral IH Knocks)...\n", dev, SPA_LISTENER_PORT);
+    printf("[SPA_AH] Waiting for SPA packets. Ctrl+C to exit.\n");
+
+    // --- Signal Handling & Pcap Loop ---
+    signal(SIGINT, spa_ah_cleanup); signal(SIGTERM, spa_ah_cleanup);
+    int pcap_ret = pcap_loop(spa_ah_pcap_handle, -1, spa_ah_packet_handler, NULL);
+
+    // --- Cleanup ---
+    printf("\n[SPA_AH] Pcap loop ended (ret %d).\n", pcap_ret);
+    pcap_freecode(&fp);
+common_cleanup: // Label for common resource cleanup on error exit
+    printf("[SPA_AH] Cleaning up...\n");
+    if (spa_ah_pcap_handle) { pcap_close(spa_ah_pcap_handle); spa_ah_pcap_handle = NULL; }
+    if (use_strdup) { free(dev); dev = NULL; }
+    EVP_cleanup(); ERR_free_strings();
+    free_ephemeral_policies(g_ephemeral_policies);
+    pthread_mutex_destroy(&g_eph_policy_lock);
+    printf("[SPA_AH] SPA Server shutdown complete.\n");
+    return (pcap_ret >= 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+// --- Signal Handler Definition ---
+void spa_ah_cleanup(int signo) {
+    printf("\n[SPA_AH] Caught signal %d, shutting down SPA listener...\n", signo);
+    if (spa_ah_pcap_handle) { pcap_breakloop(spa_ah_pcap_handle); }
+}

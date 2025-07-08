@@ -1,0 +1,29 @@
+# Add hw.c as the source for xapp_hw1
+add_executable(xapp_hw1
+  hw.c
+  ../../../../src/util/alg_ds/alg/defer.c
+)
+
+# Link xapp_hw1 with necessary libraries
+target_link_libraries(xapp_hw1
+  PUBLIC
+  e42_xapp
+  -pthread
+  -lsctp
+  -ldl
+)
+
+# Add hw2.c as the source for xapp_hw2
+add_executable(xapp_hw2
+  hw2.c
+  ../../../../src/util/alg_ds/alg/defer.c
+)
+
+# Link xapp_hw2 with necessary libraries
+target_link_libraries(xapp_hw2
+  PUBLIC
+  e42_xapp
+  -pthread
+  -lsctp
+  -ldl
+)

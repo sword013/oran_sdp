@@ -1,0 +1,39 @@
+# Makefile for SPA Server ONLY
+
+CC = gcc
+# Add -Wno-deprecated-declarations to hide the pcap_lookupdev warning if desired
+CFLAGS = -Wall -Wextra -g #-Wno-deprecated-declarations
+LDFLAGS = -lssl -lcrypto -lpcap # Link libraries
+
+# Source files needed for the SERVER
+SERVER_SRC = spa_server.c spa_common.c
+# Object files derived from SERVER sources
+SERVER_OBJ = $(SERVER_SRC:.c=.o)
+# Target executable name
+SERVER_EXE = spa_server
+
+# --- Targets ---
+
+# Default target: build the server
+all: $(SERVER_EXE)
+
+# Rule to build the server executable
+$(SERVER_EXE): $(SERVER_OBJ)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Rule to compile spa_server.c into spa_server.o
+# Depends on its source and the common header
+spa_server.o: spa_server.c spa_common.h
+	$(CC) $(CFLAGS) -c spa_server.c -o spa_server.o
+
+# Rule to compile spa_common.c into spa_common.o
+# Depends on its source and the common header
+spa_common.o: spa_common.c spa_common.h
+	$(CC) $(CFLAGS) -c spa_common.c -o spa_common.o
+
+# Clean up build files
+clean:
+	rm -f $(SERVER_EXE) $(SERVER_OBJ) *.o core
+
+# Declare phony targets (targets that aren't files)
+.PHONY: all clean

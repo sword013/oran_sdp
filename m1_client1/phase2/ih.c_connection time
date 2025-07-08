@@ -1,0 +1,394 @@
+// ih.c - Initiating Host Orchestrator (IPsec Version - OPTIMIZED + Timed Run)
+#define _GNU_SOURCE 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <signal.h>
+#include <sys/stat.h> 
+#include <time.h> // For clock_gettime
+#include <stdarg.h>
+#include <ctype.h>
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/pkcs12.h> 
+#include <openssl/pem.h>    
+
+#include "spa_common.h"
+
+// --- Configuration & State Files --- (Same as before)
+#define IH_STATE_FILE "ih_state.dat"
+#define IH_ONBOARD_CONFIG "client_onboard.conf"
+#define MAX_CONTROLLER_RESPONSE 8192
+#define EPH_KEY_FILE_PATH "/tmp/ih_eph.key"
+#define EPH_CERT_FILE_PATH "/tmp/ih_eph.crt"
+#define EPH_P12_FILE_PATH "/tmp/ih_eph.p12"
+#define EPHEMERAL_CERT_NICKNAME "client"
+#define CA_NICKNAME "MyCA"
+
+// --- Structs --- (Same as before)
+typedef struct {
+    char controller_ip[INET_ADDRSTRLEN];
+    unsigned char enc_key[MAX_KEY_LEN]; size_t enc_key_len;
+    unsigned char hmac_key[MAX_KEY_LEN]; size_t hmac_key_len;
+    unsigned char hotp_secret[MAX_KEY_LEN]; size_t hotp_secret_len;
+    char ca_cert_path[256]; char client_cert_path[256]; char client_key_path[256];
+    int has_enc, has_hmac, has_hotp, has_ca, has_cert, has_key;
+} onboarding_config_t;
+
+typedef struct {
+    char ah_ip[INET_ADDRSTRLEN];
+    unsigned char spa_enc_key[MAX_KEY_LEN]; size_t spa_enc_key_len;
+    unsigned char spa_hmac_key[MAX_KEY_LEN]; size_t spa_hmac_key_len;
+    unsigned char hotp_secret[MAX_KEY_LEN]; size_t hotp_secret_len;
+    char ih_eph_cert_path[256]; char ih_eph_key_path[256];
+    int has_ah_ip, has_spa_enc, has_spa_hmac, has_hotp, has_ih_cert, has_ih_key;
+} ephemeral_data_t;
+
+typedef struct {
+    uint64_t controller_hotp_counter; uint64_t ah_hotp_counter;
+} ih_state_t;
+
+// --- Globals --- (Same as before)
+volatile sig_atomic_t g_terminate = 0;
+onboarding_config_t g_onboard_conf;
+ephemeral_data_t g_ephemeral_data;
+ih_state_t g_ih_state;
+char g_target_ah_ip_cmd[INET_ADDRSTRLEN];
+uint8_t g_target_proto_num = 0;
+uint16_t g_target_port_num = 0;
+int g_ipsec_active = 0;
+
+// --- Function Prototypes --- (Same as before)
+void sigint_handler(int signo);
+int load_onboarding_config(const char* filename, onboarding_config_t *conf);
+int load_ih_state(const char* filename, ih_state_t *state);
+int save_ih_state(const char* filename, const ih_state_t *state);
+int execute_command(const char* command_format, ...);
+int parse_controller_response(char* response, ephemeral_data_t* eph_data);
+void cleanup_resources();
+const char* find_pem_start(const char* buffer, const char* key_marker);
+int save_pem_to_file(const char* pem_start, const char* end_marker, const char* filename, mode_t mode);
+int setup_ipsec_client();
+void cleanup_ipsec_client();
+
+// Assumed external from spa_common.c (Prototypes are in spa_common.h)
+extern void initialize_openssl(); extern void cleanup_openssl();
+extern int send_spa_packet(const char*, uint16_t, const unsigned char*, const unsigned char*, size_t, const unsigned char*, size_t, uint64_t, uint8_t, uint16_t);
+extern SSL_CTX* create_ssl_context(int); extern int configure_ssl_context(SSL_CTX*, const char*, const char*, const char*, int);
+extern SSL* establish_mtls_connection(const char*, uint16_t, SSL_CTX*); extern int send_data_over_mtls(SSL*, const char*);
+extern void handle_openssl_error(const char*); extern const char* protocol_to_string(int); extern int string_to_protocol(const char*);
+extern char* trim_whitespace(char *str); extern int hex_string_to_bytes(const char*, unsigned char*, size_t);
+
+
+// --- Signal Handler ---
+void sigint_handler(int signo) {
+    if (g_terminate == 0) {
+        g_terminate = 1; // Set flag to allow main loop (if any) to break
+        // No printf here, main will print after successful run before raising signal
+    }
+}
+
+// --- Config/State/Execute/PEM Helpers ---
+// (load_onboarding_config, load_ih_state, save_ih_state, execute_command, 
+//  find_pem_start, save_pem_to_file, parse_controller_response, 
+//  setup_ipsec_client, cleanup_ipsec_client, cleanup_resources functions
+//  are IDENTICAL to your previously provided `ih.c` version.
+//  Please ensure you copy them here if you are replacing the entire file.)
+int load_onboarding_config(const char* filename, onboarding_config_t *conf) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) { perror("[IH] Error opening onboard config"); return 0; }
+    // printf("[IH] Loading onboard config: %s\n", filename); // Verbose
+    memset(conf, 0, sizeof(onboarding_config_t)); char line[1024]; int ln = 0, is = 0;
+    char cip[INET_ADDRSTRLEN] = {0};
+    while (fgets(line, sizeof(line), fp)) {
+        ln++; char *t = trim_whitespace(line); if (!t || !t[0] || t[0] == '#') continue;
+        if (t[0] == '[' && t[strlen(t) - 1] == ']') {
+            size_t il = strlen(t) - 2; if (il > 0 && il < INET_ADDRSTRLEN) {
+                strncpy(cip, t + 1, il); cip[il] = '\0'; struct sockaddr_in sa;
+                if (inet_pton(AF_INET, cip, &sa.sin_addr) != 1) { fclose(fp); return 0; }
+                strncpy(conf->controller_ip, cip, sizeof(conf->controller_ip) - 1); is = 1;
+            } else { fclose(fp); return 0; }
+        } else if (is) {
+            char *k = t, *v = NULL; for (char *p = k; *p; ++p) if (isspace((unsigned char)*p) || *p == '=') {*p=0; v=p+1; while(*v&&(isspace((unsigned char)*v)||*v=='='))v++; break;}
+            if (v && *v) { k=trim_whitespace(k); char *cs=strchr(v,'#'); if(cs)*cs=0; v=trim_whitespace(v); if(!*k||!*v)continue;
+                if (strcasecmp(k, "ENCRYPTION_KEY")==0){int l=hex_string_to_bytes(v,conf->enc_key,MAX_KEY_LEN); if(l>0){conf->enc_key_len=l;conf->has_enc=1;}else{fclose(fp);return 0;}}
+                else if (strcasecmp(k, "HMAC_KEY")==0){int l=hex_string_to_bytes(v,conf->hmac_key,MAX_KEY_LEN); if(l>0){conf->hmac_key_len=l;conf->has_hmac=1;}else{fclose(fp);return 0;}}
+                else if (strcasecmp(k, "HOTP_SECRET")==0){int l=hex_string_to_bytes(v,conf->hotp_secret,MAX_KEY_LEN); if(l>0){conf->hotp_secret_len=l;conf->has_hotp=1;}else{fclose(fp);return 0;}}
+                else if (strcasecmp(k, "CA_CERT_PATH")==0){strncpy(conf->ca_cert_path,v,sizeof(conf->ca_cert_path)-1);conf->has_ca=1;}
+                else if (strcasecmp(k, "CLIENT_CERT_PATH")==0){strncpy(conf->client_cert_path,v,sizeof(conf->client_cert_path)-1);conf->has_cert=1;}
+                else if (strcasecmp(k, "CLIENT_KEY_PATH")==0){strncpy(conf->client_key_path,v,sizeof(conf->client_key_path)-1);conf->has_key=1;}
+            }
+        }
+    } fclose(fp);
+    if(!conf->has_enc||!conf->has_hmac||!conf->has_hotp||!conf->has_ca||!conf->has_cert||!conf->has_key||!*conf->controller_ip) return 0;
+    return 1;
+}
+int load_ih_state(const char* filename, ih_state_t *state) { /* ... Same as before ... */ 
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) { state->controller_hotp_counter = 0; state->ah_hotp_counter = 0; return 1; }
+    if (fread(state, sizeof(ih_state_t), 1, fp) != 1) { fclose(fp); state->controller_hotp_counter = 0; state->ah_hotp_counter = 0; return 0; }
+    fclose(fp); return 1;
+}
+int save_ih_state(const char* filename, const ih_state_t *state) { /* ... Same as before ... */ 
+    FILE *fp = fopen(filename, "wb"); if (!fp) return 0;
+    if (fwrite(state, sizeof(ih_state_t), 1, fp) != 1) { fclose(fp); return 0; }
+    fclose(fp); return 1;
+}
+int execute_command(const char* command_format, ...) { /* ... Same as before, but ensure no internal prints if you want clean output ... */
+    va_list args; char *command = NULL; int sys_ret = -1, exit_status = -1;
+    va_start(args, command_format); if (vasprintf(&command, command_format, args) == -1) { va_end(args); return -1; } va_end(args);
+    // printf("[IH_EXEC] %s\n", command); // Optional: Keep for debugging, comment for clean output
+    fflush(stdout); sys_ret = system(command);
+    if (sys_ret == -1) { exit_status = -1; } else { if (WIFEXITED(sys_ret)) exit_status = WEXITSTATUS(sys_ret); else if (WIFSIGNALED(sys_ret)) exit_status = -2; else exit_status = -3; }
+    free(command); return exit_status;
+}
+const char* find_pem_start(const char* buffer, const char* key_marker) { /* ... Same as before ... */ 
+    if (!buffer || !key_marker) return NULL; const char* key_ptr = strstr(buffer, key_marker); if (!key_ptr) return NULL;
+    const char* value_start = strchr(key_ptr, ':'); if (!value_start) return NULL; value_start++; return strstr(value_start, "-----BEGIN");
+}
+int save_pem_to_file(const char* pem_start, const char* end_marker, const char* filename, mode_t mode) { /* ... Same as before ... */ 
+    if (!pem_start || !end_marker || !filename) return 0; const char* pem_end = strstr(pem_start, end_marker); if (!pem_end) return 0;
+    pem_end += strlen(end_marker); while (*pem_end == '\r' || *pem_end == '\n' || isspace((unsigned char)*pem_end)) pem_end++;
+    size_t pem_len = pem_end - pem_start; if (pem_len == 0) return 0; FILE* fp = fopen(filename, "w"); if (!fp) return 0;
+    if (fwrite(pem_start, 1, pem_len, fp) != pem_len) { fclose(fp); remove(filename); return 0; } fclose(fp);
+    if (chmod(filename, mode) == -1) { /* perror for chmod optional */ } return 1;
+}
+int parse_controller_response(char* response_orig, ephemeral_data_t* eph_data) { /* ... Same as before ... */ 
+    memset(eph_data, 0, sizeof(ephemeral_data_t));
+    snprintf(eph_data->ih_eph_cert_path, sizeof(eph_data->ih_eph_cert_path), EPH_CERT_FILE_PATH);
+    snprintf(eph_data->ih_eph_key_path, sizeof(eph_data->ih_eph_key_path), EPH_KEY_FILE_PATH);
+    char *current_line = response_orig; char *next_line = NULL;
+    while (current_line != NULL && *current_line != '\0') {
+        next_line = strchr(current_line, '\n'); size_t line_len;
+        if (next_line) { line_len = next_line - current_line; *next_line = '\0';} else { line_len = strlen(current_line); }
+        if (strncmp(current_line, "-----BEGIN", 10) != 0 && strncmp(current_line,"END_RESPONSE", 12) != 0) {
+            char *line_copy = strndup(current_line, line_len); if (!line_copy) { if(next_line) *next_line = '\n'; return 0; }
+            char *key = line_copy; char *value = strchr(key, ':');
+            if (value) { *value = '\0'; value++; key = trim_whitespace(key); value = trim_whitespace(value);
+                if (strlen(key) > 0 && strlen(value) > 0) {
+                    if (strcasecmp(key, "AH_IP") == 0) { strncpy(eph_data->ah_ip, value, sizeof(eph_data->ah_ip)-1); eph_data->has_ah_ip=1;}
+                    else if (strcasecmp(key, "EPH_SPA_ENC_KEY") == 0) { int l=hex_string_to_bytes(value,eph_data->spa_enc_key,MAX_KEY_LEN); if(l>0){eph_data->spa_enc_key_len=l;eph_data->has_spa_enc=1;}}
+                    else if (strcasecmp(key, "EPH_SPA_HMAC_KEY") == 0){ int l=hex_string_to_bytes(value,eph_data->spa_hmac_key,MAX_KEY_LEN); if(l>0){eph_data->spa_hmac_key_len=l;eph_data->has_spa_hmac=1;}}
+                    else if (strcasecmp(key, "EPH_HOTP_SECRET") == 0) { int l=hex_string_to_bytes(value,eph_data->hotp_secret,MAX_KEY_LEN); if(l>0){eph_data->hotp_secret_len=l;eph_data->has_hotp=1;}}
+                }
+            } free(line_copy);
+        }
+        if (next_line) { *next_line = '\n'; current_line = next_line + 1; } else { current_line = NULL; }
+    }
+    const char *pem_ih_cert = find_pem_start(response_orig, "IH_EPH_CERT:"); if (pem_ih_cert && save_pem_to_file(pem_ih_cert, "-----END CERTIFICATE-----", eph_data->ih_eph_cert_path, 0644)) eph_data->has_ih_cert = 1; else eph_data->has_ih_cert = 0;
+    const char *pem_ih_key = find_pem_start(response_orig, "IH_EPH_KEY:"); if (pem_ih_key && save_pem_to_file(pem_ih_key, "-----END PRIVATE KEY-----", eph_data->ih_eph_key_path, 0600)) eph_data->has_ih_key = 1; else eph_data->has_ih_key = 0;
+    if (!eph_data->has_ah_ip||!eph_data->has_spa_enc||!eph_data->has_spa_hmac||!eph_data->has_hotp||!eph_data->has_ih_cert||!eph_data->has_ih_key) { if(eph_data->has_ih_cert)remove(eph_data->ih_eph_cert_path); if(eph_data->has_ih_key)remove(eph_data->ih_eph_key_path); return 0; }
+    if (strcmp(g_target_ah_ip_cmd, eph_data->ah_ip) != 0) { remove(eph_data->ih_eph_cert_path); remove(eph_data->ih_eph_key_path); return 0; }
+    return 1;
+}
+int setup_ipsec_client() { /* ... Same as before ... */
+    int ret; char cmd[1024];
+    ret = execute_command("openssl pkcs12 -export -in %s -inkey %s -certfile %s -name \"%s\" -out %s -passout pass:", g_ephemeral_data.ih_eph_cert_path, g_ephemeral_data.ih_eph_key_path, g_onboard_conf.ca_cert_path, EPHEMERAL_CERT_NICKNAME, EPH_P12_FILE_PATH); if (ret != 0) return 0;
+    ret = execute_command("certutil -A -d sql:/var/lib/ipsec/nss -n \"%s\" -t \"CT,,\" -a -i %s", CA_NICKNAME, g_onboard_conf.ca_cert_path); if (ret != 0 && ret != 255) { /* Optionally return 0 */ }
+    ret = execute_command("pk12util -i %s -d sql:/var/lib/ipsec/nss/ -n \"%s\" -W ''", EPH_P12_FILE_PATH, EPHEMERAL_CERT_NICKNAME); if (ret != 0) { /* Warning */ }
+    execute_command("certutil -L -d sql:/var/lib/ipsec/nss");
+    ret = execute_command("ipsec auto --add client-to-server"); if (ret != 0) { /* Warning */ }
+    return 1;
+}
+void cleanup_ipsec_client() { /* ... Same as before ... */
+    if (g_ipsec_active) { execute_command("ipsec auto --down client-to-server"); g_ipsec_active = 0; }
+    execute_command("ipsec auto --delete client-to-server");
+    execute_command("certutil -D -d sql:/var/lib/ipsec/nss -n '%s'", EPHEMERAL_CERT_NICKNAME);
+    remove(EPH_P12_FILE_PATH); remove(EPH_CERT_FILE_PATH); remove(EPH_KEY_FILE_PATH);
+}
+void cleanup_resources(){ /* ... Same as before ... */
+    remove(EPH_CERT_FILE_PATH); remove(EPH_KEY_FILE_PATH); remove(EPH_P12_FILE_PATH);
+}
+
+// --- Main Orchestration with Timing ---
+int main(int argc, char *argv[]) {
+    if (geteuid() != 0) {
+        fprintf(stderr, "[IH] Error: This application must be run as root for IPsec commands.\n");
+        return EXIT_FAILURE;
+    }
+
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s <target_ah_ip> <service_proto> <service_port>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    strncpy(g_target_ah_ip_cmd, argv[1], sizeof(g_target_ah_ip_cmd) - 1);
+    g_target_ah_ip_cmd[sizeof(g_target_ah_ip_cmd) - 1] = '\0';
+    const char* req_proto_str = argv[2];
+    g_target_port_num = (uint16_t)atoi(argv[3]);
+
+    int tpni = string_to_protocol(req_proto_str);
+    if (tpni < 0) { tpni = atoi(req_proto_str); }
+    if (tpni <= 0 || tpni > 255) { fprintf(stderr,"[IH] Error: Invalid protocol '%s'\n", req_proto_str); return EXIT_FAILURE; }
+    g_target_proto_num = (uint8_t)tpni;
+    if (g_target_port_num == 0 && strcmp(argv[3], "0") != 0) { fprintf(stderr,"[IH] Error: Invalid port '%s'\n", argv[3]); return EXIT_FAILURE; }
+
+    char target_service_id_str[64];
+    snprintf(target_service_id_str, sizeof(target_service_id_str), "%s/%u", req_proto_str, g_target_port_num);
+
+    SSL_CTX *ctl_ctx = NULL;
+    SSL *ctl_ssl = NULL;
+    int main_ret = EXIT_FAILURE;
+
+    struct timespec t_start, t_spa1_sent, t_mtls_ctrl_done, t_creds_rcvd, 
+                    t_spa2_sent, t_ipsec_up_done;
+    double setup_time_ms;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigint_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    initialize_openssl();
+
+    if (!load_onboarding_config(IH_ONBOARD_CONFIG, &g_onboard_conf)) {
+        fprintf(stderr, "[IH] Fatal: Failed to load onboarding config '%s'.\n", IH_ONBOARD_CONFIG);
+        goto main_cleanup_no_ipsec;
+    }
+    if (!load_ih_state(IH_STATE_FILE, &g_ih_state)) {
+        fprintf(stderr, "[IH] Warning: Failed to load state file '%s', starting counters at 0.\n", IH_STATE_FILE);
+    }
+
+    // Start timing for the entire setup process
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    // --- Step 1: SPA -> Controller ---
+    g_ih_state.controller_hotp_counter++;
+    if (send_spa_packet(g_onboard_conf.controller_ip, SPA_LISTENER_PORT,
+                                 g_onboard_conf.enc_key,
+                                 g_onboard_conf.hmac_key, g_onboard_conf.hmac_key_len,
+                                 g_onboard_conf.hotp_secret, g_onboard_conf.hotp_secret_len,
+                                 g_ih_state.controller_hotp_counter,
+                                 0, 0) != 0) {
+        fprintf(stderr, "[IH] Failed sending SPA to controller.\n");
+        g_ih_state.controller_hotp_counter--;
+        goto main_cleanup_no_ipsec;
+    }
+    save_ih_state(IH_STATE_FILE, &g_ih_state);
+    clock_gettime(CLOCK_MONOTONIC, &t_spa1_sent);
+    usleep(100000); // 50ms - keep this minimal, controller should be fast
+
+    // --- Step 2: mTLS -> Controller ---
+    ctl_ctx = create_ssl_context(0);
+    if (!ctl_ctx) { goto main_cleanup_no_ipsec; }
+    if (!configure_ssl_context(ctl_ctx, g_onboard_conf.ca_cert_path, g_onboard_conf.client_cert_path, g_onboard_conf.client_key_path, 0)) {
+        goto main_cleanup_no_ipsec;
+    }
+    ctl_ssl = establish_mtls_connection(g_onboard_conf.controller_ip, CONTROLLER_MTLS_PORT, ctl_ctx);
+    if (!ctl_ssl) {
+        goto main_cleanup_no_ipsec;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t_mtls_ctrl_done);
+
+    // --- Step 3: AuthReq -> Controller ---
+    char req_buffer[256];
+    snprintf(req_buffer, sizeof(req_buffer), "AUTH_REQ:TARGET_IP=%s:SERVICE=%s\n", g_target_ah_ip_cmd, target_service_id_str);
+    if (send_data_over_mtls(ctl_ssl, req_buffer) <= 0) {
+        goto main_cleanup_no_ipsec;
+    }
+
+    // --- Step 4: RecvCreds <- Controller ---
+    char resp_buffer[MAX_CONTROLLER_RESPONSE];
+    int bytes_read = SSL_read(ctl_ssl, resp_buffer, sizeof(resp_buffer) - 1);
+    if (bytes_read <= 0) {
+        handle_openssl_error("[IH] Reading response from controller");
+        goto main_cleanup_no_ipsec;
+    }
+    resp_buffer[bytes_read] = '\0';
+    clock_gettime(CLOCK_MONOTONIC, &t_creds_rcvd);
+
+    SSL_shutdown(ctl_ssl); SSL_free(ctl_ssl); ctl_ssl = NULL;
+    SSL_CTX_free(ctl_ctx); ctl_ctx = NULL;
+
+    if (!parse_controller_response(resp_buffer, &g_ephemeral_data)) {
+        fprintf(stderr, "[IH] Failed to parse credentials from controller.\n");
+        goto main_cleanup_ipsec; // IPsec cleanup might not be needed if certs weren't saved
+    }
+    g_ih_state.ah_hotp_counter = 0; // Reset AH counter for new session
+    save_ih_state(IH_STATE_FILE, &g_ih_state);
+
+    // --- Step 5: Setup local IPsec (using received ephemeral certs) ---
+    if (!setup_ipsec_client()) {
+        fprintf(stderr, "[IH] Failed during IPsec client setup.\n");
+        goto main_cleanup_ipsec;
+    }
+
+    // --- Step 6: SPA Knock -> AH ---
+    g_ih_state.ah_hotp_counter++;
+    if (send_spa_packet(g_ephemeral_data.ah_ip, SPA_LISTENER_PORT,
+                                 g_ephemeral_data.spa_enc_key,
+                                 g_ephemeral_data.spa_hmac_key, g_ephemeral_data.spa_hmac_key_len,
+                                 g_ephemeral_data.hotp_secret, g_ephemeral_data.hotp_secret_len,
+                                 g_ih_state.ah_hotp_counter,
+                                 g_target_proto_num, g_target_port_num) != 0) {
+        fprintf(stderr, "[IH] Failed sending SPA to AH.\n");
+        g_ih_state.ah_hotp_counter--;
+        save_ih_state(IH_STATE_FILE, &g_ih_state);
+        goto main_cleanup_ipsec;
+    }
+    save_ih_state(IH_STATE_FILE, &g_ih_state);
+    clock_gettime(CLOCK_MONOTONIC, &t_spa2_sent);
+     usleep(100000); // 50ms - keep minimal, AH should be fast with iptables
+
+    // --- Step 7: Bring up IPsec Tunnel ---
+    printf("[IH] Initiating IPsec Tunnel 'client-to-server' to AH %s ...\n", g_ephemeral_data.ah_ip);
+    int ipsec_up_ret = execute_command("ipsec auto --up client-to-server");
+    if (ipsec_up_ret != 0) {
+        fprintf(stderr, "[IH] Failed ipsec --up (ret:%d). Check system IPsec logs.\n", ipsec_up_ret);
+        g_ipsec_active = 0; 
+        goto main_cleanup_ipsec;
+    }
+    printf("[IH] IPsec tunnel 'client-to-server' initiated successfully.\n");
+    g_ipsec_active = 1; 
+    clock_gettime(CLOCK_MONOTONIC, &t_ipsec_up_done); // Timing ends when IPsec is up
+
+    // Calculate setup time
+    setup_time_ms = (t_ipsec_up_done.tv_sec - t_start.tv_sec) * 1000.0;
+    setup_time_ms += (t_ipsec_up_done.tv_nsec - t_start.tv_nsec) / 1000000.0;
+
+    printf("\n-----------------------------------------------------\n");
+    printf("CONNECTION SETUP SUCCESSFUL!\n");
+    printf("Total Connection Setup Time: %.3f ms\n", setup_time_ms);
+    printf("-----------------------------------------------------\n");
+    
+    main_ret = EXIT_SUCCESS;
+    
+    // Instead of waiting for Ctrl+C, now we will raise SIGINT to trigger cleanup and exit.
+    printf("[IH] Run complete. Signaling self for cleanup and exit...\n");
+    // Flush output before raising signal
+    fflush(stdout);
+    fflush(stderr);
+    raise(SIGINT); // Trigger the sigint_handler which sets g_terminate
+
+    // The following loop is effectively bypassed by raise(SIGINT) if handled.
+    // It's here as a fallback if signal handling had issues or for other termination conditions.
+    while (!g_terminate) {
+        pause(); 
+    }
+
+main_cleanup_ipsec:
+    // printf("[IH] IPsec-related cleanup sequence initiated...\n"); // Verbose
+    cleanup_ipsec_client(); 
+
+main_cleanup_no_ipsec: // Label for cleanup excluding IPsec if setup failed before it
+    // printf("[IH] General resource cleanup initiated...\n"); // Verbose
+    cleanup_resources();    
+
+    if (ctl_ssl) { SSL_shutdown(ctl_ssl); SSL_free(ctl_ssl); }
+    if (ctl_ctx) { SSL_CTX_free(ctl_ctx); }
+
+    cleanup_openssl();
+    printf("[IH] Application Finished. Exit code (0=success, 1=failure): %d\n", (main_ret == EXIT_SUCCESS ? 0 : 1) );
+    return main_ret;
+}
+

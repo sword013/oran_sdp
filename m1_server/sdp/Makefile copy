@@ -1,0 +1,43 @@
+# Makefile for SDP Accepting Host (AH) Server
+
+CC = gcc
+# Need -std=gnu99 or later for vasprintf
+# Need -pthread for multi-threading
+CFLAGS = -Wall -Wextra -g -std=gnu99 -pthread
+# Link OpenSSL, math library, pcap, and pthreads
+LDFLAGS = -lssl -lcrypto -lm -lpcap -pthread
+
+# Common source file (ensure path is correct or copy it here)
+COMMON_SRC = spa_common.c
+COMMON_OBJ = $(COMMON_SRC:.c=.o)
+
+# AH Server source file
+AH_SRC = ah.c
+AH_OBJ = $(AH_SRC:.c=.o)
+AH_EXE = ah_server
+
+# --- Targets ---
+
+# Default target: build the AH server
+all: $(AH_EXE)
+
+# Rule to build the AH server executable
+$(AH_EXE): $(AH_OBJ) $(COMMON_OBJ)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Rule to compile ah.c
+# Depends on its source and header files
+$(AH_OBJ): $(AH_SRC) ah_structs.h spa_common.h
+	$(CC) $(CFLAGS) -c $(AH_SRC) -o $(AH_OBJ)
+
+# Rule to compile spa_common.c
+# Depends on its source and the common header
+$(COMMON_OBJ): $(COMMON_SRC) spa_common.h
+	$(CC) $(CFLAGS) -c $(COMMON_SRC) -o $(COMMON_OBJ)
+
+# Clean up build files
+clean:
+	rm -f $(AH_EXE) $(AH_OBJ) $(COMMON_OBJ) *.o core
+
+# Declare phony targets
+.PHONY: all clean

@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "in.h": "c",
+        "err.h": "c",
+        "spa_common.h": "c"
+    }
+}

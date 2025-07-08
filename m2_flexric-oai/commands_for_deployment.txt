@@ -1,0 +1,114 @@
+Term 1 : 
+    1  sudo apt update
+    2  sudo apt upgrade -y
+    3  sudo apt update
+    4  clear
+    5  sudo apt install git vim tree net-tools libsctp-dev python3.8 cmake-curses-gui libpcre2-dev python-dev build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev libconfig++-dev libtool autoconf python3-pip curl bison flex iperf unzip
+    6  sudo apt install git vim tree net-tools libsctp-dev cmake-curses-gui libpcre2-dev  build-essential cmake libfftw3-dev libmbedtls-dev libboost-program-options-dev libconfig++-dev libtool autoconf python3-pip curl bison flex iperf unzip
+    7  sudo apt install dirmngr ca-certificates software-properties-common 
+    8  apt-transport-https -y
+    9  sudo gpg --list-keys
+   10  sudo gpg --no-default-keyring --keyring /usr/share/keyrings/deadsnakes.gpg 
+   11  --keyserver keyserver.ubuntu.com --recv-keys 
+   12  F23C5A6CF475977595C89F51BA6932366A755776
+   13  sudo apt install python3.8
+   14  sudo add-apt-repository ppa:deadsnakes/ppa
+   15  sudo apt update
+   16  sudo apt install python3.8
+   17  sudo apt install python3-dev
+   18  sudo apt install python-dev
+   19  sudo apt install python2-dev
+   20  gcc --version
+   21  sudo apt install build-essential
+   22  sudo apt -y install gcc-7 g++-7 gcc-8 g++-8 gcc-9 g++-9
+   23  sudo apt update
+   24  sudo apt install gcc-12 g++-12
+   25  gcc-12 --version
+   26  g++-12 --version
+   27  sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 60 --slave /usr/bin/g++ g++ /usr/bin/g++-12
+   28  gcc --version
+   29  g++ --version
+   30  git clone https://github.com/swig/swig.git
+   31  cd swig/
+   32  git checkout release-4.1
+   33  ./autogen.sh
+   34  ./configure --prefix=/usr/
+   35  make -j8
+   36  sudo make install
+   37  sudo apt install -y putty ca-certificates gnupg
+   38  sudo install -m 0755 -d /etc/apt/keyrings
+   39  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+   40  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+   41  echo "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+   42  sudo apt-get update
+   43  sudo apt install -y docker-buildx-plugin docker-compose-plugin
+   44  sudo docker compose version
+   45  history
+   46  sudo apt install docker-ce docker-ce-cli containerd.io
+   47  sudo docker --version
+   48  sudo docker compose version
+   49  cd
+   50  clear
+   51  sudo apt-get install unzip
+   52  clear
+   53  wget -O ~/oai-cn5g.zip https://gitlab.eurecom.fr/oai/openairinterface5g/-/archive/develop/openairinterface5g-develop.zip?path=doc/tutorial_resources/oai-cn5g
+   54  unzip ~/oai-cn5g.zip
+   55  mv ~/openairinterface5g-develop-doc-tutorial_resources-oai-cn5g/doc/tutorial_resources/oai-cn5g ~/oai-cn5g
+   56  rm -r ~/openairinterface5g-develop-doc-tutorial_resources-oai-cn5g ~/oai-cn5g.zip
+   57  cd ~/oai-cn5g
+   58  sudo docker compose pull
+   59  sudo docker compose up -d
+   60  sudo docker ps -a
+   61  sudo docker compose down
+   62  git clone https://github.com/openaicellular/openairinterface5G.git ~/oai
+   63  cd ~/oai
+   64  git checkout oaic_workshop_2024_v1
+   65  cd ~/oai/cmake_targets/
+   66  ./build_oai -I -w SIMU --gNB --nrUE --build-e2 --ninja
+   67  cd ~/flexric
+   68  git checkout beabdd07
+   69  mkdir build
+   70  cd build
+   71  cmake ../
+   72  make -j`nproc`
+   73  sudo make install
+   74  cd ~/oai-cn5g
+   75  sudo docker compose up -d
+   76  cd ~/
+   77  sudo docker ps -a
+   78  clear
+   79  sudo docker ps -a
+   80  cd ~/oai/cmake_targets/ran_build/build
+   81  sudo ./nr-softmodem -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --gNBs.[0].min_rxtxtime 6 --rfsim --sa
+   82  gedit ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf 
+   83  sudo ./nr-softmodem -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf --gNBs.[0].min_rxtxtime 6 --rfsim --sa
+   84  history >> ~/commands_for_deployment.txt 
+   
+   
+   
+Term 2 : 
+    1  cd ~/oai/cmake_targets/ran_build/build
+    2  sudo ./nr-uesoftmodem -r 106 --numerology 1 --band 78 -C 3619200000 --rfsim --sa --uicc0.imsi 001010000000001 --rfsimulator.serveraddr 127.0.0.1
+    3  history >> ~/commands_for_deployment.txt 
+    
+    
+    
+    Term 3 : 
+    
+   
+    1  cd ~/
+    2  ./flexric/build/examples/ric/nearRT-RIC
+    3  history >> ~/commands_for_deployment.txt 
+    
+    
+    Term 4 : 
+    
+    
+    1  ping 192.168.70.135 -I oaitun_ue1
+    2  ifconfig
+    3  ifconfig | grep ue
+    4  ifconfig
+    5  iperf -s -u -i 1 -B 10.0.0.2
+    6  ifconfig
+    7  iperf -s -u -i 1 -B 10.0.0.3
+    8  history >> ~/commands_for_deployment.txt 

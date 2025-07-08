@@ -1,0 +1,456 @@
+// spa_server_controller.c
+#define _GNU_SOURCE // For asprintf
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <pcap.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/err.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <ifaddrs.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <endian.h>
+#include <errno.h>
+
+#include "spa_common.h"
+#include "controller_structs.h"
+
+// --- Global Variables ---
+pcap_t *spa_pcap_handle = NULL;
+extern onboard_credential_t *g_onboard_creds;
+extern pthread_mutex_t g_onboard_lock;
+pthread_mutex_t rule_cleanup_lock = PTHREAD_MUTEX_INITIALIZER; // To protect access to cleanup_scheduled_for_ip
+#define MAX_CONCURRENT_CLEANUPS 32 // Simple way to avoid too many cleanup threads for same IP
+char cleanup_scheduled_for_ip[MAX_CONCURRENT_CLEANUPS][INET_ADDRSTRLEN] = {0};
+time_t cleanup_expiry_time[MAX_CONCURRENT_CLEANUPS] = {0};
+
+
+// --- Constants for nftables (used in command strings) ---
+#define NFT_FAMILY_STR_CMD "inet"
+#define NFT_TABLE_NAME_CMD "filter"
+#define NFT_CHAIN_NAME_CMD "sdp_rules_chain"
+
+// --- Function Prototypes ---
+void spa_controller_cleanup(int signo);
+int load_onboard_credentials(const char *filename);
+onboard_credential_t* find_onboard_credential(const char *ip_str);
+void free_onboard_credentials(onboard_credential_t *head);
+
+int add_nft_rule_for_spa(const char* source_ip_str, uint16_t target_port_host,
+                         const char* family_str, const char* table_name, const char* chain_name,
+                         const char* comment_str);
+void schedule_nft_chain_flush(const char* family_str, const char* table_name, const char* chain_name,
+                               int delay_seconds, const char* for_ip); // Added for_ip for tracking
+void* nft_chain_flush_thread_func(void *arg);
+
+
+typedef struct {
+    char family_str[16];
+    char table_name[64];
+    char chain_name[64];
+    char triggering_ip[INET_ADDRSTRLEN]; // IP that triggered this cleanup
+    int delay_seconds;
+} nft_flush_arg_t;
+
+
+int load_onboard_credentials(const char *filename) { /* ... same as before ... */
+   FILE *fp = fopen(filename, "r");
+   if (!fp) { perror("Error opening onboard cred file"); return 0; }
+   printf("[SPA_CTRL] Loading onboarding credentials from: %s\n", filename);
+   char line[1024]; int line_num = 0; int creds_loaded = 0;
+   onboard_credential_t *current_cred = NULL;
+   while (fgets(line, sizeof(line), fp)) {
+       line_num++;
+       char *trimmed_line = trim_whitespace(line);
+       if (!trimmed_line || trimmed_line[0] == '\0' || trimmed_line[0] == '#') continue;
+       if (trimmed_line[0] == '[' && trimmed_line[strlen(trimmed_line) - 1] == ']') {
+           if (current_cred) {
+               if(current_cred->has_enc && current_cred->has_hmac && current_cred->has_hotp && current_cred->has_counter) {
+                  current_cred->next = g_onboard_creds; g_onboard_creds = current_cred; creds_loaded++;
+               } else { fprintf(stderr,"[SPA_CTRL] Warn: Discard incomplete onboard entry for [%s] line %d\n", current_cred->entity_ip, line_num-1); free(current_cred); }
+               current_cred = NULL;
+           }
+           current_cred = malloc(sizeof(onboard_credential_t));
+           if (!current_cred) { perror("Malloc failed onboard cred"); fclose(fp); return 0; }
+           memset(current_cred, 0, sizeof(onboard_credential_t));
+           size_t id_len = strlen(trimmed_line) - 2;
+           if (id_len == 0 || id_len >= INET_ADDRSTRLEN) {fprintf(stderr,"[SPA_CTRL] Invalid header line %d\n", line_num); free(current_cred); current_cred = NULL; continue; }
+           strncpy(current_cred->entity_ip, trimmed_line + 1, id_len); current_cred->entity_ip[id_len] = '\0';
+           struct sockaddr_in sa; if (inet_pton(AF_INET, current_cred->entity_ip, &sa.sin_addr)!=1){fprintf(stderr,"[SPA_CTRL] Invalid IP '%s' line %d\n",current_cred->entity_ip, line_num); free(current_cred); current_cred=NULL; continue;}
+       } else if (current_cred) {
+            char *key = trimmed_line; char *value = NULL;
+            for (char *p = key; *p != '\0'; ++p) { if (isspace((unsigned char)*p) || *p == '=') { *p = '\0'; value = p + 1; while (*value != '\0' && (isspace((unsigned char)*value) || *value == '=')) { value++; } break; } }
+            if (value && *value != '\0') {
+               key = trim_whitespace(key); value = trim_whitespace(value);
+               if (strlen(key) == 0) continue;
+               if (strcasecmp(key, "ENCRYPTION_KEY") == 0) { int len=hex_string_to_bytes(value, current_cred->enc_key, MAX_KEY_LEN); if(len>0){current_cred->enc_key_len=len; current_cred->has_enc=1;} }
+               else if (strcasecmp(key, "HMAC_KEY") == 0) { int len=hex_string_to_bytes(value, current_cred->hmac_key, MAX_KEY_LEN); if(len>0){current_cred->hmac_key_len=len; current_cred->has_hmac=1;} }
+               else if (strcasecmp(key, "HOTP_SECRET") == 0) { int len=hex_string_to_bytes(value, current_cred->hotp_secret, MAX_KEY_LEN); if(len>0){current_cred->hotp_secret_len=len; current_cred->has_hotp=1;} }
+               else if (strcasecmp(key, "HOTP_NEXT_COUNTER") == 0) { current_cred->hotp_next_counter = strtoull(value, NULL, 10); current_cred->has_counter=1; }
+           }
+       }
+   }
+    if (current_cred) { if(current_cred->has_enc && current_cred->has_hmac && current_cred->has_hotp && current_cred->has_counter) { current_cred->next = g_onboard_creds; g_onboard_creds = current_cred; creds_loaded++;} else { free(current_cred); } }
+   fclose(fp);
+   printf("[SPA_CTRL] Finished loading onboard credentials. %d entries loaded.\n", creds_loaded);
+   return creds_loaded >= 0;
+}
+onboard_credential_t* find_onboard_credential(const char *ip_str) { /* ... same as before ... */
+   if (!ip_str) return NULL;
+   onboard_credential_t *current = g_onboard_creds;
+   while (current != NULL) { if (strcmp(current->entity_ip, ip_str) == 0) return current; current = current->next; }
+   return NULL;
+}
+void free_onboard_credentials(onboard_credential_t *head) { /* ... same as before ... */
+    onboard_credential_t *current = head, *next;
+    while(current){ next = current->next; free(current); current = next;}
+    g_onboard_creds = NULL;
+}
+
+
+int add_nft_rule_for_spa(const char* source_ip_str, uint16_t target_port_host,
+                         const char* family_str, const char* table_name, const char* chain_name,
+                         const char* comment_str) {
+    char* cmd = NULL;
+    int ret_sys;
+    int success_status = -1;
+
+    // `nft insert rule` adds at the beginning of the chain (or specified position)
+    if (asprintf(&cmd, "nft insert rule %s %s %s position 0 ip saddr %s tcp dport %u accept comment \"%s\"",
+                 family_str, table_name, chain_name,
+                 source_ip_str, target_port_host, comment_str) == -1) {
+        perror("[SPA_CTRL_NFT_SYS] asprintf for add rule failed");
+        return -1;
+    }
+
+    printf("[SPA_CTRL_NFT_SYS] Executing: %s\n", cmd);
+    ret_sys = system(cmd);
+    
+    if (ret_sys == -1) {
+        perror("[SPA_CTRL_NFT_SYS] system(nft) call failed");
+        free(cmd);
+        return -1;
+    }
+
+    if (WIFEXITED(ret_sys) && WEXITSTATUS(ret_sys) == 0) {
+        printf("[SPA_CTRL_NFT_SYS] nft add rule for %s (comment: %s) successful.\n", source_ip_str, comment_str);
+        success_status = 0;
+    } else {
+        fprintf(stderr, "[SPA_CTRL_NFT_SYS] nft add rule for %s (comment: %s) failed (nft exit status: %d).\n",
+                source_ip_str, comment_str, WIFEXITED(ret_sys) ? WEXITSTATUS(ret_sys) : -1);
+        success_status = -1;
+    }
+    
+    free(cmd);
+    return success_status;
+}
+
+void* nft_chain_flush_thread_func(void *arg) {
+    nft_flush_arg_t *cleanup_data = (nft_flush_arg_t*)arg;
+    char* cmd = NULL;
+    int i;
+
+    if (!cleanup_data) {
+        fprintf(stderr, "[SPA_CTRL_NFT_SYS_Cleanup] Invalid argument to cleanup thread.\n");
+        pthread_detach(pthread_self());
+        return NULL;
+    }
+
+    printf("[SPA_CTRL_NFT_SYS_Cleanup] Thread for chain %s/%s/%s (triggered by %s). Sleeping %d sec.\n",
+           cleanup_data->family_str, cleanup_data->table_name, cleanup_data->chain_name,
+           cleanup_data->triggering_ip, cleanup_data->delay_seconds);
+
+    sleep(cleanup_data->delay_seconds);
+
+    // Before flushing, remove this IP from the scheduled list
+    pthread_mutex_lock(&rule_cleanup_lock);
+    for (i = 0; i < MAX_CONCURRENT_CLEANUPS; i++) {
+        if (cleanup_expiry_time[i] != 0 && strcmp(cleanup_scheduled_for_ip[i], cleanup_data->triggering_ip) == 0) {
+            printf("[SPA_CTRL_NFT_SYS_Cleanup] Clearing schedule slot for IP %s\n", cleanup_data->triggering_ip);
+            cleanup_scheduled_for_ip[i][0] = '\0';
+            cleanup_expiry_time[i] = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&rule_cleanup_lock);
+
+
+    printf("[SPA_CTRL_NFT_SYS_Cleanup] Woke up. Flushing chain %s/%s/%s (triggered by %s)\n",
+           cleanup_data->family_str, cleanup_data->table_name, cleanup_data->chain_name,
+           cleanup_data->triggering_ip);
+
+    if (asprintf(&cmd, "nft flush chain %s %s %s",
+                 cleanup_data->family_str, cleanup_data->table_name, cleanup_data->chain_name) == -1) {
+        perror("[SPA_CTRL_NFT_SYS_Cleanup] asprintf for flush chain failed");
+    } else {
+        printf("[SPA_CTRL_NFT_SYS_Cleanup] Executing: %s\n", cmd);
+        int ret_sys = system(cmd);
+        if (ret_sys == -1 || (WIFEXITED(ret_sys) && WEXITSTATUS(ret_sys) != 0)) {
+            fprintf(stderr, "[SPA_CTRL_NFT_SYS_Cleanup] Failed to flush chain %s/%s/%s (exit status: %d)\n",
+                    cleanup_data->family_str, cleanup_data->table_name, cleanup_data->chain_name,
+                    WIFEXITED(ret_sys) ? WEXITSTATUS(ret_sys) : -1);
+        } else {
+            printf("[SPA_CTRL_NFT_SYS_Cleanup] Successfully flushed chain %s/%s/%s.\n",
+                   cleanup_data->family_str, cleanup_data->table_name, cleanup_data->chain_name);
+        }
+        free(cmd);
+    }
+
+    free(cleanup_data);
+    pthread_detach(pthread_self());
+    return NULL;
+}
+
+void schedule_nft_chain_flush(const char* family_str, const char* table_name, const char* chain_name,
+                               int delay_seconds, const char* for_ip) {
+    pthread_t tid;
+    nft_flush_arg_t *arg = NULL;
+    int i;
+    time_t now = time(NULL);
+    time_t new_expiry = now + delay_seconds;
+
+    pthread_mutex_lock(&rule_cleanup_lock);
+    // Check if a cleanup for this IP is already scheduled and if this one is later
+    for (i = 0; i < MAX_CONCURRENT_CLEANUPS; i++) {
+        if (cleanup_expiry_time[i] != 0 && strcmp(cleanup_scheduled_for_ip[i], for_ip) == 0) {
+            if (new_expiry > cleanup_expiry_time[i]) {
+                printf("[SPA_CTRL_NFT_SYS] Updating existing cleanup schedule for IP %s to %d seconds.\n", for_ip, delay_seconds);
+                cleanup_expiry_time[i] = new_expiry; // Extend expiry
+            } else {
+                printf("[SPA_CTRL_NFT_SYS] Cleanup already scheduled for IP %s sooner or at same time. Ignoring new schedule.\n", for_ip);
+            }
+            pthread_mutex_unlock(&rule_cleanup_lock);
+            return; // Don't schedule a new one if one is already active and sufficient
+        }
+    }
+
+    // Find an empty slot to schedule a new cleanup
+    int found_slot = -1;
+    for (i = 0; i < MAX_CONCURRENT_CLEANUPS; i++) {
+        if (cleanup_expiry_time[i] == 0) {
+            found_slot = i;
+            break;
+        }
+    }
+
+    if (found_slot == -1) {
+        fprintf(stderr, "[SPA_CTRL_NFT_SYS] Max concurrent cleanups reached. Cannot schedule for IP %s.\n", for_ip);
+        pthread_mutex_unlock(&rule_cleanup_lock);
+        return;
+    }
+
+    // Schedule new cleanup
+    strncpy(cleanup_scheduled_for_ip[found_slot], for_ip, INET_ADDRSTRLEN -1);
+    cleanup_scheduled_for_ip[found_slot][INET_ADDRSTRLEN -1] = '\0';
+    cleanup_expiry_time[found_slot] = new_expiry;
+    pthread_mutex_unlock(&rule_cleanup_lock);
+
+    arg = malloc(sizeof(nft_flush_arg_t));
+    if (!arg) {
+        perror("[SPA_CTRL_NFT_SYS] malloc for flush thread arg failed");
+        // Clear the schedule slot if malloc fails
+        pthread_mutex_lock(&rule_cleanup_lock);
+        cleanup_scheduled_for_ip[found_slot][0] = '\0';
+        cleanup_expiry_time[found_slot] = 0;
+        pthread_mutex_unlock(&rule_cleanup_lock);
+        return;
+    }
+
+    strncpy(arg->family_str, family_str, sizeof(arg->family_str)-1);
+    arg->family_str[sizeof(arg->family_str)-1] = '\0';
+    strncpy(arg->table_name, table_name, sizeof(arg->table_name)-1);
+    arg->table_name[sizeof(arg->table_name)-1] = '\0';
+    strncpy(arg->chain_name, chain_name, sizeof(arg->chain_name)-1);
+    arg->chain_name[sizeof(arg->chain_name)-1] = '\0';
+    strncpy(arg->triggering_ip, for_ip, INET_ADDRSTRLEN -1);
+    arg->triggering_ip[INET_ADDRSTRLEN -1] = '\0';
+    arg->delay_seconds = delay_seconds;
+
+    if (pthread_create(&tid, NULL, nft_chain_flush_thread_func, arg) != 0) {
+        perror("[SPA_CTRL_NFT_SYS] pthread_create for flush failed");
+        free(arg);
+        // Clear the schedule slot if thread creation fails
+        pthread_mutex_lock(&rule_cleanup_lock);
+        cleanup_scheduled_for_ip[found_slot][0] = '\0';
+        cleanup_expiry_time[found_slot] = 0;
+        pthread_mutex_unlock(&rule_cleanup_lock);
+    }
+}
+
+void spa_controller_packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+   const int ETH_HDR_LEN = 14;
+   char source_ip_str[INET_ADDRSTRLEN];
+   struct tm *tm_info; time_t now_time; char time_buf[30];
+
+   (void)user_data;
+   now_time = time(NULL); tm_info = localtime(&now_time); strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+
+   if (pkthdr->caplen < (unsigned int)ETH_HDR_LEN) return;
+   const struct ip *ip_header = (struct ip *)(packet + ETH_HDR_LEN);
+   int ip_hdr_len = ip_header->ip_hl * 4;
+   if (pkthdr->caplen < (unsigned int)(ETH_HDR_LEN + ip_hdr_len)) return;
+   if (ip_header->ip_p != IPPROTO_UDP) return;
+   const struct udphdr *udp_header = (struct udphdr *)((u_char *)ip_header + ip_hdr_len);
+   int udp_hdr_len = sizeof(struct udphdr);
+   if (pkthdr->caplen < (unsigned int)(ETH_HDR_LEN + ip_hdr_len + udp_hdr_len)) return;
+   inet_ntop(AF_INET, &(ip_header->ip_src), source_ip_str, INET_ADDRSTRLEN);
+
+   onboard_credential_t *creds = find_onboard_credential(source_ip_str);
+   if (!creds) { return; }
+
+   const u_char *payload = (u_char *)udp_header + udp_hdr_len;
+   int payload_len = pkthdr->caplen - (ETH_HDR_LEN + ip_hdr_len + udp_hdr_len);
+   if ((size_t)payload_len < SPA_PACKET_MIN_LEN || (size_t)payload_len > SPA_PACKET_MAX_LEN) { return; }
+
+   const unsigned char *iv = payload;
+   const unsigned char *encrypted_data = payload + SPA_IV_LEN;
+   int encrypted_len_val = payload_len - SPA_IV_LEN - SPA_HMAC_LEN;
+   const unsigned char *received_hmac = payload + SPA_IV_LEN + encrypted_len_val;
+   if (encrypted_len_val <= 0) { return; }
+
+   unsigned char calculated_hmac[EVP_MAX_MD_SIZE]; unsigned int calc_hmac_len = 0;
+   const EVP_MD *digest = EVP_get_digestbyname(SPA_HMAC_ALGO); if (!digest) return;
+   unsigned char *data_to_hmac_buf = malloc(SPA_IV_LEN + encrypted_len_val);
+   if(!data_to_hmac_buf) { perror("malloc"); return; }
+   memcpy(data_to_hmac_buf, iv, SPA_IV_LEN); memcpy(data_to_hmac_buf + SPA_IV_LEN, encrypted_data, encrypted_len_val);
+   HMAC(digest, creds->hmac_key, creds->hmac_key_len, data_to_hmac_buf, SPA_IV_LEN + encrypted_len_val, calculated_hmac, &calc_hmac_len);
+   free(data_to_hmac_buf);
+   if (calc_hmac_len != SPA_HMAC_LEN || constant_time_memcmp(received_hmac, calculated_hmac, SPA_HMAC_LEN) != 0) { return; }
+
+   unsigned char decrypted_data_buf[sizeof(spa_data_t) + SPA_IV_LEN];
+   int decrypted_len_val = 0, final_len_val = 0;
+   int decrypt_ok = 1;
+   const EVP_CIPHER *cipher = EVP_get_cipherbyname(SPA_ENCRYPTION_ALGO); if (!cipher) return;
+   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new(); if (!ctx) { handle_openssl_error("CTX New"); return; }
+   if (1!=EVP_DecryptInit_ex(ctx, cipher, NULL, creds->enc_key, iv)) { handle_openssl_error("DecryptInit"); decrypt_ok = 0; }
+   if (decrypt_ok && 1!=EVP_DecryptUpdate(ctx, decrypted_data_buf, &decrypted_len_val, encrypted_data, encrypted_len_val)) { ERR_clear_error(); }
+   if (decrypt_ok && 1!=EVP_DecryptFinal_ex(ctx, decrypted_data_buf + decrypted_len_val, &final_len_val)) { ERR_clear_error(); decrypt_ok = 0; }
+   EVP_CIPHER_CTX_free(ctx);
+   if (!decrypt_ok) { return; }
+   decrypted_len_val += final_len_val;
+
+   if ((size_t)decrypted_len_val != sizeof(spa_data_t)) { return; }
+   spa_data_t *spa_info = (spa_data_t *)decrypted_data_buf;
+   uint64_t received_timestamp = be64toh(spa_info->timestamp);
+   uint64_t received_hotp_counter = be64toh(spa_info->hotp_counter);
+   uint32_t received_hotp_code = ntohl(spa_info->hotp_code);
+   if (spa_info->version != SPA_VERSION) { return; }
+   time_t current_time = time(NULL); int64_t time_diff = (int64_t)current_time - (int64_t)received_timestamp;
+   if (llabs(time_diff) > SPA_TIMESTAMP_WINDOW_SECONDS) { return; }
+
+   pthread_mutex_lock(&g_onboard_lock);
+   uint64_t expected_counter = creds->hotp_next_counter;
+   int hotp_match = 0;
+   if (!(received_hotp_counter < expected_counter || received_hotp_counter > expected_counter + HOTP_COUNTER_SYNC_WINDOW)) {
+       for (uint64_t counter_check = received_hotp_counter; counter_check <= expected_counter + HOTP_COUNTER_SYNC_WINDOW; ++counter_check) {
+           if (generate_hotp(creds->hotp_secret, creds->hotp_secret_len, counter_check, HOTP_CODE_DIGITS) == received_hotp_code) {
+               hotp_match = 1; creds->hotp_next_counter = counter_check + 1; break;
+           }
+       }
+   }
+   pthread_mutex_unlock(&g_onboard_lock);
+   if (!hotp_match) { return; }
+
+   printf("[%s %s] VALID Onboarding SPA. Authorizing mTLS via nft (system call)...\n", time_buf, source_ip_str);
+
+   char comment_tag[128];
+   snprintf(comment_tag, sizeof(comment_tag), "SPA_CTRL_ALLOW_%s_P%u", source_ip_str, CONTROLLER_MTLS_PORT);
+
+   if (add_nft_rule_for_spa(source_ip_str, CONTROLLER_MTLS_PORT,
+                               NFT_FAMILY_STR_CMD, NFT_TABLE_NAME_CMD, NFT_CHAIN_NAME_CMD,
+                               comment_tag) == 0) {
+       // Schedule a flush of the sdp_rules_chain.
+       // The simple locking mechanism tries to prevent redundant flush threads
+       // if multiple SPA packets arrive close together.
+       schedule_nft_chain_flush(NFT_FAMILY_STR_CMD, NFT_TABLE_NAME_CMD, NFT_CHAIN_NAME_CMD,
+                                SPA_DEFAULT_DURATION_SECONDS, source_ip_str);
+   } else {
+       fprintf(stderr, "[SPA_CTRL_NFT_SYS] CRITICAL: Failed to add nftables rule for %s. Client connection will fail.\n", source_ip_str);
+   }
+}
+
+int main(int argc, char *argv[]) { /* ... same as your last working main ... */
+   char errbuf[PCAP_ERRBUF_SIZE]; char *dev = NULL; bpf_u_int32 net, mask; struct bpf_program fp;
+   char filter_exp[100]; int use_strdup = 0;
+
+   if (geteuid() != 0) { fprintf(stderr, "[SPA_CTRL] Error: Requires root privileges for pcap and nftables.\n"); return 1; }
+
+   if (!load_onboard_credentials("controller_onboard.conf")) {
+       fprintf(stderr, "[SPA_CTRL] Fatal: No valid onboarding credentials loaded.\n"); return 1;
+   }
+   if (!g_onboard_creds) { fprintf(stderr,"[SPA_CTRL] Fatal: Credential list is empty after load.\n"); return 1;}
+
+    if (argc > 2 && strcmp(argv[1], "-i") == 0) {
+       if (argc > 2 && argv[2] != NULL) { dev = argv[2]; }
+       else { fprintf(stderr, "[SPA_CTRL] Error: -i requires interface name.\n"); free_onboard_credentials(g_onboard_creds); return 1; }
+   } else if (argc > 1) { fprintf(stderr, "[SPA_CTRL] Usage: %s [-i interface]\n", argv[0]); free_onboard_credentials(g_onboard_creds); return 1; }
+   else {
+       printf("[SPA_CTRL] Finding default interface...\n");
+       dev = pcap_lookupdev(errbuf);
+       if (!dev) {
+           fprintf(stderr, "[SPA_CTRL] Warn: pcap_lookupdev failed: %s. Using fallback '%s'.\n", errbuf, SPA_INTERFACE);
+           dev = strdup(SPA_INTERFACE);
+           if (!dev) { perror("strdup for SPA_INTERFACE failed"); free_onboard_credentials(g_onboard_creds); return 2;}
+           use_strdup = 1;
+        }
+   }
+   printf("[SPA_CTRL] Using interface: %s\n", dev);
+
+   OpenSSL_add_all_algorithms(); ERR_load_crypto_strings();
+   if (!EVP_get_cipherbyname(SPA_ENCRYPTION_ALGO)) { fprintf(stderr, "Fatal: Cipher '%s' not found.\n", SPA_ENCRYPTION_ALGO); if(use_strdup)free(dev); free_onboard_credentials(g_onboard_creds); return 1; }
+   if (!EVP_get_digestbyname(SPA_HMAC_ALGO)) { fprintf(stderr, "Fatal: Digest '%s' not found.\n", SPA_HMAC_ALGO); if(use_strdup)free(dev); free_onboard_credentials(g_onboard_creds); return 1; }
+   if (!EVP_get_digestbyname(SPA_HOTP_HMAC_ALGO)) { fprintf(stderr, "Fatal: HOTP Digest '%s' not found.\n", SPA_HOTP_HMAC_ALGO); if(use_strdup)free(dev); free_onboard_credentials(g_onboard_creds); return 1; }
+   printf("[SPA_CTRL] Crypto algorithms OK.\n");
+
+   if (pcap_lookupnet(dev, &net, &mask, errbuf) == -1) { fprintf(stderr, "[SPA_CTRL] Warn: No netmask for %s: %s\n", dev, errbuf); net=0; mask=0; }
+   spa_pcap_handle = pcap_open_live(dev, BUFSIZ, 1, 100, errbuf);
+   if (!spa_pcap_handle) { fprintf(stderr, "[SPA_CTRL] Fatal: pcap_open_live on %s: %s\n", dev, errbuf); if(use_strdup)free(dev); free_onboard_credentials(g_onboard_creds); return 2; }
+   if (pcap_datalink(spa_pcap_handle) != DLT_EN10MB) { fprintf(stderr, "[SPA_CTRL] Warn: %s is not Ethernet.\n", dev); }
+   snprintf(filter_exp, sizeof(filter_exp), "udp dst port %d", SPA_LISTENER_PORT);
+   printf("[SPA_CTRL] Compiling filter: '%s'\n", filter_exp);
+   if (pcap_compile(spa_pcap_handle, &fp, filter_exp, 0, net) == -1) { fprintf(stderr, "[SPA_CTRL] Fatal: Filter compile: %s\n", pcap_geterr(spa_pcap_handle)); pcap_close(spa_pcap_handle); if(use_strdup)free(dev); free_onboard_credentials(g_onboard_creds); return 2; }
+   if (pcap_setfilter(spa_pcap_handle, &fp) == -1) { fprintf(stderr, "[SPA_CTRL] Fatal: Set filter: %s\n", pcap_geterr(spa_pcap_handle)); pcap_freecode(&fp); pcap_close(spa_pcap_handle); if(use_strdup)free(dev); free_onboard_credentials(g_onboard_creds); return 2; }
+
+   printf("[SPA_CTRL] SPA Server listening on %s, UDP port %d (for Onboarding)...\n", dev, SPA_LISTENER_PORT);
+   printf("[SPA_CTRL] Waiting for SPA packets. Ctrl+C to exit.\n");
+
+   signal(SIGINT, spa_controller_cleanup); signal(SIGTERM, spa_controller_cleanup);
+   int pcap_ret = pcap_loop(spa_pcap_handle, -1, spa_controller_packet_handler, NULL);
+
+   printf("\n[SPA_CTRL] Pcap loop ended (ret %d).\n", pcap_ret);
+   if (pcap_ret == -1 && !(errno == EINTR || pcap_ret == -2) ) {
+        fprintf(stderr, "[SPA_CTRL] Pcap loop error: %s\n", pcap_geterr(spa_pcap_handle));
+   }
+   printf("[SPA_CTRL] Cleaning up...\n");
+   pcap_freecode(&fp);
+   if (spa_pcap_handle) { pcap_close(spa_pcap_handle); spa_pcap_handle = NULL; }
+   if (use_strdup) { free(dev); dev = NULL; }
+   EVP_cleanup(); ERR_free_strings();
+   free_onboard_credentials(g_onboard_creds);
+   pthread_mutex_destroy(&g_onboard_lock);
+   pthread_mutex_destroy(&rule_cleanup_lock); // Destroy the new mutex
+   printf("[SPA_CTRL] SPA Server shutdown complete.\n");
+   return 0;
+}
+
+void spa_controller_cleanup(int signo) { /* ... same as before ... */
+   printf("\n[SPA_CTRL] Caught signal %d, shutting down SPA listener...\n", signo);
+   if (spa_pcap_handle) {
+       pcap_breakloop(spa_pcap_handle);
+   }
+}
+
+

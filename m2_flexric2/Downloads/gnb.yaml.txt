@@ -1,0 +1,36 @@
+amf:
+  addr: 127.0.0.5                                                
+  bind_addr: 127.0.0.1 
+
+ru_sdr:
+  device_driver: uhd                # The RF driver name.
+  device_args: type=b200,num_recv_frames=64,num_send_frames=64            # Optionally pass arguments to the selected RF driver.
+  clock: internal
+  sync: internal 
+  srate: 11.52                      # RF sample rate might need to be adjusted according to selected bandwidth.
+  tx_gain: 40                       # Transmit gain of the RF might need to adjusted to the given situation.
+  rx_gain: 50                       # Receive gain of the RF might need to adjusted to the given situation.
+
+cell_cfg:
+  dl_arfcn: 368500                  # ARFCN of the downlink carrier (center frequency).
+  band: 3                           # The NR band.
+  channel_bandwidth_MHz: 10         # Bandwith in MHz. Number of PRBs will be automatically derived.
+  common_scs: 15                    # Subcarrier spacing in kHz used for data.
+  plmn: "00101"                     # PLMN broadcasted by the gNB.
+  tac: 7                            # Tracking area code (needs to match the core configuration).
+  pdcch:
+    common:
+      ss0_index: 0                  # Set search space zero index to match srsUE capabilities
+      #coreset0_index: 12            # Set search CORESET Zero index to match srsUE capabilities
+    dedicated:
+      ss2_type: common              # Search Space type, has to be set to common
+      dci_format_0_1_and_1_1: false # Set correct DCI format (fallback)
+  prach:
+    prach_config_index: 1           # Sets PRACH config to match what is expected by srsUE
+
+
+pcap:
+  mac_enable: enable                                              # Set to true to enable MAC-layer PCAP>
+  mac_filename: /tmp/gnb_mac.pcap                                 # Path where the MAC PCAP is stored.
+  ngap_enable: enable                                             # Set to true to enable NGAP PCAPs.
+  ngap_filename: /tmp/gnb_ngap.pcap                               # Path where the NGAP PCAP is stored.

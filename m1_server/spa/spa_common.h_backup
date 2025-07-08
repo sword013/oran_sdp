@@ -1,0 +1,46 @@
+// spa_common.h (Common definitions for client and server)
+#ifndef SPA_COMMON_H
+#define SPA_COMMON_H
+
+#include <stdint.h>
+#include <netinet/in.h> // For IPPROTO_* constants
+#include <stdlib.h>     // For size_t if needed standalone
+#include <ctype.h>      // For isspace (used in server)
+#include <string.h>     // For strcasecmp, strlen etc (used in server)
+#include <arpa/inet.h>  // For INET_ADDRSTRLEN
+
+// --- Configuration ---
+#define SPA_SERVER_UDP_PORT 62201
+#define SPA_TIMESTAMP_WINDOW_SECONDS 60
+#define SPA_DEFAULT_DURATION_SECONDS 30
+#define SPA_INTERFACE       "eth0"
+
+// --- Cryptography Details ---
+#define SPA_ENCRYPTION_ALGO "aes-256-cbc"
+#define SPA_HMAC_ALGO       "sha256"
+#define SPA_IV_LEN          16
+#define SPA_HMAC_LEN        32
+#define SPA_NONCE_LEN       16
+#define MAX_KEY_LEN         64 // Max *binary* key length
+
+// --- Packet Structure (Sent by Client) ---
+#define SPA_VERSION 1
+typedef struct __attribute__((packed)) {
+    uint8_t  version;
+    uint64_t timestamp;
+    uint32_t source_ip; // Optional - Network Byte Order
+    uint8_t  req_protocol;
+    uint16_t req_port; // Target Port - Network Byte Order
+    uint8_t  nonce[SPA_NONCE_LEN];
+} spa_data_t;
+
+// --- Wire Format ---
+// [ IV | Encrypted spa_data_t | HMAC ]
+#define SPA_PACKET_MIN_LEN (SPA_IV_LEN + sizeof(spa_data_t) + SPA_HMAC_LEN)
+#define SPA_PACKET_MAX_LEN (SPA_IV_LEN + sizeof(spa_data_t) + SPA_IV_LEN + SPA_HMAC_LEN)
+
+// Helper Prototypes (Assume defined in spa_common.c)
+const char* protocol_to_string(int proto);
+int string_to_protocol(const char* proto_str);
+
+#endif // SPA_COMMON_H

@@ -1,0 +1,246 @@
+// ah.c - Accepting Host / Gateway Orchestrator
+#define _GNU_SOURCE // For asprintf
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/file.h> // For flock
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#include "spa_common.h"
+#include "ah_structs.h"
+
+// --- Configuration ---
+#define AH_ONBOARD_CONFIG "ah_onboard.conf"
+#define AH_ACCESS_CONFIG "access_ah.conf" // File for ephemeral policies
+
+// --- Globals (Defined Extern in ah_structs.h) ---
+ephemeral_policy_t *g_ephemeral_policies = NULL;
+pthread_mutex_t g_eph_policy_lock = PTHREAD_MUTEX_INITIALIZER;
+SSL_CTX *g_controller_ssl_ctx = NULL;   // Context for talking TO controller
+SSL *g_controller_ssl_conn = NULL;      // Persistent connection TO controller
+pthread_mutex_t g_ctrl_conn_lock = PTHREAD_MUTEX_INITIALIZER; // Lock for controller connection ptr
+volatile sig_atomic_t g_main_shutdown_flag = 0;
+
+// --- Function Prototypes ---
+void ah_main_cleanup(int signo);
+int load_ah_onboard_config(const char* filename, ah_onboard_config_t *conf);
+int connect_to_controller(ah_onboard_config_t *conf);
+void* controller_listener_thread(void *arg); // Thread to listen for controller messages
+int update_ephemeral_policy_file(const char* filename, const char* ih_ip, uint8_t proto, uint16_t port,
+                                const char* enc_hex, const char* hmac_hex, const char* hotp_hex,
+                                time_t expiry);
+// Assumed external (Defined in spa_common.c now)
+// extern void handle_openssl_error(const char *msg);
+// extern SSL_CTX* create_ssl_context(int is_server);
+// extern int configure_ssl_context(SSL_CTX *ctx, const char* ca_path, const char* cert_path, const char* key_path, int is_server);
+// extern SSL* establish_mtls_connection(const char* server_ip, uint16_t port, SSL_CTX *ctx);
+// extern char* trim_whitespace(char *str);
+// extern int send_data_over_mtls(SSL *ssl, const char *data);
+
+
+// --- Configuration Loading ---
+int load_ah_onboard_config(const char* filename, ah_onboard_config_t *conf) {
+    // ... (Implementation from previous response - unchanged) ...
+    FILE *fp = fopen(filename, "r");
+    if (!fp) { perror("[AH_MAIN] Error opening AH onboard config"); return 0; }
+    printf("[AH_MAIN] Loading AH onboarding config from: %s\n", filename);
+
+    char line[1024]; int line_num = 0; int in_stanza = 0;
+    int found_ca = 0, found_cert = 0, found_key = 0;
+    conf->controller_ip[0] = '\0'; // Ensure controller IP is empty initially
+
+    while (fgets(line, sizeof(line), fp)) {
+        line_num++;
+        char *trimmed_line = trim_whitespace(line);
+        if (!trimmed_line || trimmed_line[0] == '\0' || trimmed_line[0] == '#') continue;
+
+        if (trimmed_line[0] == '[' && trimmed_line[strlen(trimmed_line) - 1] == ']') {
+             size_t id_len = strlen(trimmed_line) - 2;
+             if (id_len > 0 && id_len < INET_ADDRSTRLEN) {
+                 strncpy(conf->controller_ip, trimmed_line + 1, id_len);
+                 conf->controller_ip[id_len] = '\0';
+                 printf("[AH_MAIN] Found Controller IP: %s\n", conf->controller_ip);
+                 struct sockaddr_in sa; if (inet_pton(AF_INET, conf->controller_ip, &(sa.sin_addr)) != 1) { fprintf(stderr,"Invalid IP line %d\n",line_num); fclose(fp); return 0;}
+                 in_stanza = 1;
+             } else { fprintf(stderr, "[AH_MAIN] Invalid stanza header line %d\n", line_num); fclose(fp); return 0;} // Invalid stanza is fatal here
+        } else if (in_stanza) {
+            char *key = trimmed_line; char *value = NULL;
+            for (char *p = key; *p != '\0'; ++p) { if (isspace((unsigned char)*p) || *p == '=') { *p = '\0'; value = p + 1; while (*value != '\0' && (isspace((unsigned char)*value) || *value == '=')) { value++; } break; } }
+
+            if (value && *value != '\0') {
+                 key = trim_whitespace(key); value = trim_whitespace(value);
+                 if (strlen(key) == 0) continue;
+                 if (strcasecmp(key, "CA_CERT_PATH") == 0) { strncpy(conf->ca_cert_path, value, sizeof(conf->ca_cert_path)-1); conf->ca_cert_path[sizeof(conf->ca_cert_path)-1]='\0'; found_ca=1;}
+                 else if (strcasecmp(key, "CLIENT_CERT_PATH") == 0) { strncpy(conf->client_cert_path, value, sizeof(conf->client_cert_path)-1); conf->client_cert_path[sizeof(conf->client_cert_path)-1]='\0'; found_cert=1;}
+                 else if (strcasecmp(key, "CLIENT_KEY_PATH") == 0) { strncpy(conf->client_key_path, value, sizeof(conf->client_key_path)-1); conf->client_key_path[sizeof(conf->client_key_path)-1]='\0'; found_key=1;}
+                 else { /* Ignore other keys */ }
+            }
+        }
+    }
+    fclose(fp);
+    if (!found_ca || !found_cert || !found_key || strlen(conf->controller_ip) == 0) {
+        fprintf(stderr, "[AH_MAIN] Error: Missing required fields in %s\n", filename); return 0;
+    }
+    printf("[AH_MAIN] AH Onboarding config loaded successfully.\n");
+    return 1;
+}
+
+
+// --- Connect to Controller (Persistent mTLS) ---
+int connect_to_controller(ah_onboard_config_t *conf) {
+    printf("[AH_MAIN] Attempting persistent mTLS connection to Controller %s:%d...\n",
+           conf->controller_ip, CONTROLLER_MTLS_PORT);
+
+    pthread_mutex_lock(&g_ctrl_conn_lock);
+    if (g_controller_ssl_ctx == NULL) {
+        // *** CORRECTED CALL ***
+        g_controller_ssl_ctx = create_ssl_context(0); // 0 = Client mode
+        if (!g_controller_ssl_ctx) { pthread_mutex_unlock(&g_ctrl_conn_lock); return 0; }
+        // *** CORRECTED CALL ***
+        if (!configure_ssl_context(g_controller_ssl_ctx,
+                              conf->ca_cert_path,
+                              conf->client_cert_path,
+                              conf->client_key_path,
+                              0)) // 0 = Client mode
+        {
+            fprintf(stderr, "[AH_MAIN] Failed to configure SSL context for controller connection.\n");
+            SSL_CTX_free(g_controller_ssl_ctx); g_controller_ssl_ctx = NULL;
+            pthread_mutex_unlock(&g_ctrl_conn_lock); return 0;
+        }
+    }
+
+    if (g_controller_ssl_conn != NULL) {
+        SSL_shutdown(g_controller_ssl_conn); SSL_free(g_controller_ssl_conn); g_controller_ssl_conn = NULL;
+    }
+
+    g_controller_ssl_conn = establish_mtls_connection(conf->controller_ip,
+                                                     CONTROLLER_MTLS_PORT,
+                                                     g_controller_ssl_ctx);
+
+    if (g_controller_ssl_conn) {
+        printf("[AH_MAIN] mTLS connection to Controller established.\n");
+        if (send_data_over_mtls(g_controller_ssl_conn, "AH_REGISTER\n") <= 0) {
+            fprintf(stderr, "[AH_MAIN] Failed to send AH_REGISTER to controller.\n");
+            SSL_shutdown(g_controller_ssl_conn); SSL_free(g_controller_ssl_conn); g_controller_ssl_conn = NULL;
+            pthread_mutex_unlock(&g_ctrl_conn_lock); return 0;
+        }
+        pthread_mutex_unlock(&g_ctrl_conn_lock);
+        return 1; // Success
+    } else {
+        fprintf(stderr, "[AH_MAIN] Failed to establish mTLS connection to Controller.\n");
+        pthread_mutex_unlock(&g_ctrl_conn_lock);
+        return 0; // Failure
+    }
+}
+
+
+// --- Update Ephemeral Policy File ---
+int update_ephemeral_policy_file(const char* filename, const char* ih_ip, uint8_t proto, uint16_t port,
+                                const char* enc_hex, const char* hmac_hex, const char* hotp_hex,
+                                time_t expiry)
+{
+    // ... (Implementation from previous response - unchanged, ensure fprintf typo is fixed) ...
+    printf("[AH_MAIN] Updating ephemeral policy file %s for IH %s\n", filename, ih_ip);
+    FILE* fp = fopen(filename, "a+"); // Append or create
+    if (!fp) { perror("[AH_MAIN] Failed to open ephemeral policy file for update"); return 0; }
+    if (flock(fileno(fp), LOCK_EX) == -1) { perror("[AH_MAIN] Failed to lock policy file"); fclose(fp); return 0; }
+    printf("[AH_MAIN] Policy file locked.\n");
+    // Simplistic: Append new entry. Needs improvement for updates/cleanup.
+    fprintf(fp, "\n[%s]\n", ih_ip);
+    fprintf(fp, "  ENCRYPTION_KEY %s\n", enc_hex);
+    fprintf(fp, "  HMAC_KEY %s\n", hmac_hex);
+    fprintf(fp, "  HOTP_SECRET %s\n", hotp_hex);
+    fprintf(fp, "  HOTP_NEXT_COUNTER 0\n");
+    fprintf(fp, "  ALLOWED_PROTO %u\n", proto);
+    fprintf(fp, "  ALLOWED_PORT %u\n", port);
+    fprintf(fp, "  EXPIRY_TIMESTAMP %lu\n", (unsigned long)expiry); // *** Corrected fprintf ***
+    fflush(fp); flock(fileno(fp), LOCK_UN); fclose(fp);
+    printf("[AH_MAIN] Policy file unlocked.\n");
+    printf("[AH_MAIN] !!! Policy file updated. spa_server_ah needs reload mechanism !!!\n");
+    return 1;
+}
+
+
+// --- Controller Listener Thread ---
+void* controller_listener_thread(void *arg) {
+    // ... (Implementation from previous response - unchanged) ...
+    (void)arg;
+    char buffer[4096]; int bytes_read; int reconnect_delay = 5;
+    printf("[AH_CTRL_Listen] Controller listener thread started.\n");
+    while (!g_main_shutdown_flag) {
+        SSL *conn = NULL;
+        pthread_mutex_lock(&g_ctrl_conn_lock); conn = g_controller_ssl_conn; pthread_mutex_unlock(&g_ctrl_conn_lock);
+        if (!conn) { printf("[AH_CTRL_Listen] No connection. Reconnecting in %ds...\n", reconnect_delay); sleep(reconnect_delay); ah_onboard_config_t conf; load_ah_onboard_config(AH_ONBOARD_CONFIG, &conf); connect_to_controller(&conf); continue; }
+        bytes_read = SSL_read(conn, buffer, sizeof(buffer) - 1);
+        if (g_main_shutdown_flag) break;
+        if (bytes_read <= 0) { int ssl_err = SSL_get_error(conn, bytes_read); fprintf(stderr, "[AH_CTRL_Listen] SSL_read failed/closed (%d).\n", ssl_err); if(ssl_err != SSL_ERROR_ZERO_RETURN) ERR_print_errors_fp(stderr); pthread_mutex_lock(&g_ctrl_conn_lock); if (g_controller_ssl_conn == conn) { SSL_shutdown(g_controller_ssl_conn); SSL_free(g_controller_ssl_conn); g_controller_ssl_conn = NULL; printf("[AH_CTRL_Listen] Controller connection cleaned up.\n"); } pthread_mutex_unlock(&g_ctrl_conn_lock); sleep(reconnect_delay); continue; }
+        buffer[bytes_read] = '\0';
+        printf("[AH_CTRL_Listen] Received %d bytes from controller:\n%s", bytes_read, buffer);
+        if (strncmp(buffer, "NEW_SESSION", 11) == 0) {
+             char ih_ip[INET_ADDRSTRLEN] = {0}; uint8_t proto = 0; uint16_t port = 0;
+             char enc_hex[MAX_KEY_LEN*2+1]={0}, hmac_hex[MAX_KEY_LEN*2+1]={0}, hotp_hex[MAX_KEY_LEN*2+1]={0};
+             char* line = strtok(buffer, "\n");
+             while(line) { char *key = line; char* value = strchr(line, ':'); if(value) { *value='\0'; value++; key=trim_whitespace(key); value=trim_whitespace(value); if (key && value) { if(strcasecmp(key,"IH_IP")==0) strncpy(ih_ip, value, INET_ADDRSTRLEN-1); else if(strcasecmp(key,"SERVICE_PROTO")==0) proto=(uint8_t)atoi(value); else if(strcasecmp(key,"SERVICE_PORT")==0) port=(uint16_t)atoi(value); else if(strcasecmp(key,"SPA_ENC_KEY")==0) strncpy(enc_hex, value, sizeof(enc_hex)-1); else if(strcasecmp(key,"SPA_HMAC_KEY")==0) strncpy(hmac_hex, value, sizeof(hmac_hex)-1); else if(strcasecmp(key,"HOTP_SECRET")==0) strncpy(hotp_hex, value, sizeof(hotp_hex)-1); /* TODO: Parse/Save Certs */} } line = strtok(NULL, "\n"); }
+             if(strlen(ih_ip)>0 && proto > 0 && strlen(enc_hex)>0 && strlen(hmac_hex)>0 && strlen(hotp_hex)>0) { time_t expiry = time(NULL) + SPA_DEFAULT_DURATION_SECONDS + 10; update_ephemeral_policy_file(AH_ACCESS_CONFIG, ih_ip, proto, port, enc_hex, hmac_hex, hotp_hex, expiry); } else { fprintf(stderr, "[AH_CTRL_Listen] Failed parse NEW_SESSION.\n"); }
+        } else { printf("[AH_CTRL_Listen] Received unknown message.\n"); }
+    }
+    printf("[AH_CTRL_Listen] Thread exiting.\n"); return NULL;
+}
+
+// --- Signal Handler ---
+void ah_main_cleanup(int signo) {
+    printf("\n[AH_MAIN] Caught signal %d, shutting down AH...\n", signo);
+    g_main_shutdown_flag = 1;
+}
+
+// --- Main AH Function ---
+int main(int argc, char *argv[]) {
+    ah_onboard_config_t onboard_conf;
+    pthread_t listener_tid = 0;
+    (void)argc; (void)argv;
+
+    signal(SIGINT, ah_main_cleanup); signal(SIGTERM, ah_main_cleanup);
+    printf("[AH_MAIN] Starting AH Orchestrator...\n");
+    SSL_load_error_strings(); OpenSSL_add_ssl_algorithms();
+
+    if (!load_ah_onboard_config(AH_ONBOARD_CONFIG, &onboard_conf)) { fprintf(stderr, "[AH_MAIN] Failed load onboard config.\n"); return EXIT_FAILURE; }
+    printf("[AH_MAIN] NOTE: spa_server_ah and handle_connections_ah should be started separately.\n");
+
+    if (connect_to_controller(&onboard_conf)) {
+        if (pthread_create(&listener_tid, NULL, controller_listener_thread, NULL) != 0) {
+            perror("[AH_MAIN] Failed create controller listener thread");
+             pthread_mutex_lock(&g_ctrl_conn_lock); if(g_controller_ssl_conn) { SSL_shutdown(g_controller_ssl_conn); SSL_free(g_controller_ssl_conn); g_controller_ssl_conn=NULL; } if(g_controller_ssl_ctx) { SSL_CTX_free(g_controller_ssl_ctx); g_controller_ssl_ctx=NULL; } pthread_mutex_unlock(&g_ctrl_conn_lock);
+        }
+    } else { fprintf(stderr, "[AH_MAIN] Initial controller connection failed.\n"); }
+
+    printf("[AH_MAIN] Running. Waiting for signal...\n");
+    while (!g_main_shutdown_flag) { sleep(2); } // Keep main thread alive
+
+    printf("[AH_MAIN] Shutdown initiated.\n");
+    if (listener_tid != 0) { printf("[AH_MAIN] Waiting for controller listener thread...\n"); pthread_join(listener_tid, NULL); }
+    pthread_mutex_lock(&g_ctrl_conn_lock);
+    if (g_controller_ssl_conn) { printf("[AH_MAIN] Closing controller connection...\n"); SSL_shutdown(g_controller_ssl_conn); SSL_free(g_controller_ssl_conn); g_controller_ssl_conn = NULL; }
+    if (g_controller_ssl_ctx) { SSL_CTX_free(g_controller_ssl_ctx); g_controller_ssl_ctx = NULL; }
+    pthread_mutex_unlock(&g_ctrl_conn_lock);
+    // free_ephemeral_policies(g_ephemeral_policies); // This list is managed by spa_server_ah
+    pthread_mutex_destroy(&g_eph_policy_lock); pthread_mutex_destroy(&g_ctrl_conn_lock);
+    printf("[AH_MAIN] AH Orchestrator finished.\n");
+    return EXIT_SUCCESS;
+}
+
+// --- Need implementations for mTLS helpers if not in spa_common.c ---
+// (Assuming they ARE in spa_common.c as per last correction)
